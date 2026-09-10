@@ -226,16 +226,13 @@ func (dd *Sink) stopCollector() {
 }
 
 func (dd *Sink) Start() {
-	dd.senderWG.Add(1)
-	go dd.runSender()
+	dd.senderWG.Go(dd.runSender)
 	for i := uint16(0); i < dd.opts.Concurrency; i++ {
-		dd.collectorWG.Add(1)
-		go dd.runCollector()
+		dd.collectorWG.Go(dd.runCollector)
 	}
 }
 
 func (dd *Sink) runSender() {
-	defer dd.senderWG.Done()
 	for {
 		select {
 		case <-dd.stopSenderCh:
@@ -262,7 +259,6 @@ func (dd *Sink) stopSender() {
 }
 
 func (dd *Sink) runCollector() {
-	defer dd.collectorWG.Done()
 	buffer := make([]datadogV2.MetricSeries, 0, dd.opts.BatchSize)
 	timer := time.NewTimer(dd.opts.FlushInterval)
 	for {
