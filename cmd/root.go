@@ -242,7 +242,7 @@ func RunHydrolixCollector() {
 	} else {
 		mux := http.NewServeMux()
 		mux.Handle(healthz, healthHandler(c.Healthy))
-		healthSrv = &http.Server{Addr: healthzAddr, Handler: mux}
+		healthSrv = &http.Server{Addr: healthzAddr, Handler: mux, ReadTimeout: 5 * time.Second}
 		go func() {
 			if err := healthSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("health endpoint failed", "addr", healthzAddr, "error", err)
