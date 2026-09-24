@@ -23,6 +23,7 @@ type authTestServer struct {
 	queryAuth   chan string  // Authorization header seen by /query
 	rejectToken atomic.Value // string; queries carrying this token are rejected
 	rejectWith  atomic.Int64 // status for rejected tokens: 400 (qe-3's real response, default) or 401
+	rejectAll   atomic.Bool  // reject every token, including freshly issued ones
 }
 
 // Bodies as returned by qe-innovations-3 on /query (captured 2026-09-24,
@@ -54,7 +55,7 @@ func newAuthTestServer(t *testing.T) *authTestServer {
 	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		a.queryAuth <- auth
-		if bad := a.rejectToken.Load().(string); bad != "" && auth == "Bearer "+bad {
+		if bad := a.rejectToken.Load().(string); a.rejectAll.Load() || (bad != "" && auth == "Bearer "+bad) {
 			if a.rejectWith.Load() == http.StatusUnauthorized {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
@@ -424,5 +425,44 @@ func TestQueryNonAuth400DoesNotRelogin(t *testing.T) {
 	}
 	if got := a.logins.Load() - loginsBefore; got != 0 {
 		t.Fatalf("a syntax error must not trigger a re-login, got %d", got)
+	}
+}
+
+// If a freshly issued token is rejected too (e.g. the account may log in but
+// not query), logging in again cannot help: re-login must fall under the same
+// cooldown as a failed login instead of running once per query.
+func TestReloginRateLimitedWhenFreshTokenAlsoRejected(t *testing.T) {
+	a := newAuthTestServer(t)
+	setAuthEnv(t, a.host(), "", "user", "pass")
+
+	c := New("test", newOpts())
+	if c == nil {
+		t.Fatal("New returned nil")
+	}
+	defer c.cancel()
+	a.rejectAll.Store(true)
+
+	for range 10 {
+		_, err := c.Query("test_query", "select 1")
+		var qerr *QueryError
+		if !errors.As(err, &qerr) || !qerr.AuthFailed() {
+			t.Fatalf("expected an auth-failure *QueryError, got: %v", err)
+		}
+	}
+	if got := a.logins.Load(); got != 2 {
+		t.Fatalf("expected initial login + one re-login across 10 rejected queries, got %d logins", got)
+	}
+}
+
+// Hydrolix echoes the SQL in the error body - in the "query" field and inside
+// the ClickHouse message itself (shape captured from qe-3, 2026-09-24) - so
+// only the leading error code may decide whether the token was rejected.
+func TestTokenRejectedIgnoresEchoedQueryText(t *testing.T) {
+	body := `{"error": "Code: 62. DB::Exception: Syntax error: failed at position 1 (broken): broken 'AUTHENTICATION_FAILED'. Expected one of: Query, Query with output, EXPLAIN, SELECT query. (SYNTAX_ERROR)", "query": "broken 'AUTHENTICATION_FAILED'"}`
+	if tokenRejected(http.StatusBadRequest, body) {
+		t.Fatal("a syntax error whose echoed query mentions AUTHENTICATION_FAILED is not a rejected token")
+	}
+	if !tokenRejected(http.StatusBadRequest, authFailedBody) {
+		t.Fatal("qe-3's 516 body must still count as a rejected token")
 	}
 }

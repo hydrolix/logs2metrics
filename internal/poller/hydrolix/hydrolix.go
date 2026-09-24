@@ -68,10 +68,22 @@ func (e *QueryError) AuthFailed() bool {
 // tokenRejected reports whether a /query response rejected the bearer token.
 // Hydrolix answers an invalid or expired token with a 400 carrying ClickHouse
 // code 516 (AUTHENTICATION_FAILED) rather than a 401; a gateway in front of
-// the cluster may still send a 401.
+// the cluster may still send a 401. Only the leading error code is checked:
+// the rest of the body, including the ClickHouse message, echoes the SQL.
 func tokenRejected(status int, body string) bool {
-	return status == http.StatusUnauthorized ||
-		(status == http.StatusBadRequest && strings.Contains(body, "AUTHENTICATION_FAILED"))
+	if status == http.StatusUnauthorized {
+		return true
+	}
+	if status != http.StatusBadRequest {
+		return false
+	}
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		resp.Error = body
+	}
+	return strings.HasPrefix(strings.TrimSpace(resp.Error), "Code: 516.")
 }
 
 type HydrolixOpts struct {
@@ -499,6 +511,12 @@ func (c *Client) reloginAfter401(ctx context.Context, usedToken string) error {
 	return nil
 }
 
+func (c *Client) markLoginFailed(err error) {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	c.lastLoginErr, c.lastLoginFailedAt = err, time.Now()
+}
+
 func (c *Client) currentToken() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -525,6 +543,11 @@ func (c *Client) Query(queryName, sql string) (string, error) {
 		status, body, err = c.doQuery(queryName, sql, c.currentToken())
 		if err != nil {
 			return "", err
+		}
+		if tokenRejected(status, body) {
+			// A fresh token was rejected too, so logging in again will not
+			// help; hold off re-logins for reloginCooldown like a failed login.
+			c.markLoginFailed(errors.New("a freshly issued token was also rejected"))
 		}
 	}
 
