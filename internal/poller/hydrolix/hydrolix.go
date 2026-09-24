@@ -502,7 +502,7 @@ func (c *Client) reloginAfter401(ctx context.Context, usedToken string) error {
 			return fmt.Errorf("not retrying login, last attempt %s ago failed: %w", since.Round(time.Second), c.lastLoginErr)
 		}
 	}
-	slog.Warn("Query rejected with 401; re-logging in")
+	slog.Warn("Query token rejected; re-logging in")
 	if err := c.UpdateToken(ctx); err != nil {
 		c.lastLoginErr, c.lastLoginFailedAt = err, time.Now()
 		return err
@@ -538,7 +538,7 @@ func (c *Client) Query(queryName, sql string) (string, error) {
 			return "", fmt.Errorf("the static token was rejected (invalid or expired) and the collector has no credentials to refresh it - provide a valid HDX_TOKEN, or HDX_USERNAME/HDX_PASSWORD: %w", qerr)
 		}
 		if err := c.reloginAfter401(c.ctx, token); err != nil {
-			return "", fmt.Errorf("%w; re-login after 401 failed: %w", qerr, err)
+			return "", fmt.Errorf("%w; re-login after rejected token failed: %w", qerr, err)
 		}
 		status, body, err = c.doQuery(queryName, sql, c.currentToken())
 		if err != nil {
