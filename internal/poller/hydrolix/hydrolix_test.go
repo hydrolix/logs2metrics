@@ -198,7 +198,10 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(loginResponse{AccessToken: "test-token"})
 	})
-	mux.HandleFunc("/query/", func(w http.ResponseWriter, r *http.Request) {
+	var gotAdminComment, gotMethod string
+	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAdminComment = r.URL.Query().Get("hdx_query_admin_comment")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
@@ -224,9 +227,11 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 	defer cancel()
 
 	c := &Client{
-		opts:       HydrolixOpts{Host: host, Username: "u", Password: "p"},
-		httpClient: &http.Client{},
-		ctx:        ctx,
+		opts:               HydrolixOpts{Host: host, Username: "u", Password: "p"},
+		httpClient:         &http.Client{},
+		ctx:                ctx,
+		userAgentBase:      "User: " + productName,
+		queriesAreEmbedded: true,
 	}
 
 	if err := c.UpdateToken(context.Background()); err != nil {
@@ -236,12 +241,18 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 		t.Fatalf("expected token to be set to test-token, got %q", c.token)
 	}
 
-	body, err := c.Query("select 1")
+	body, err := c.Query("test_query", "select 1")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
 	if body == "" || body == "null" {
 		t.Fatalf("unexpected empty body from Query: %q", body)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("server received %s, want POST (a path redirect rewrites POST to GET)", gotMethod)
+	}
+	if want := "User: hydrolix-metrics-go query: test_query"; gotAdminComment != want {
+		t.Errorf("server received hdx_query_admin_comment = %q, want %q", gotAdminComment, want)
 	}
 
 	_ = os.Setenv("TZ", "UTC")
@@ -289,8 +300,9 @@ func newCaptureSink() *captureSink {
 	return &captureSink{store: &captureStore{}}
 }
 
-func (s *captureSink) Start() {}
-func (s *captureSink) Stop()  {}
+func (s *captureSink) Name() string { return "capture" }
+func (s *captureSink) Start()       {}
+func (s *captureSink) Stop()        {}
 
 func (s *captureSink) Gauge(name, unit string, value float64, tags sinks.Tags) {
 	s.store.gauges = append(s.store.gauges, metricCapture{name: name, unit: unit, value: value, tags: copyTags(tags)})

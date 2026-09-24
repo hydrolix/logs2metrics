@@ -52,6 +52,8 @@ func NewSink(o StatsdOpts) *Sink {
 	}
 }
 
+func (s *Sink) Name() string { return "statsd" }
+
 func (s *Sink) Start() {
 	conn, err := net.Dial("udp", s.opts.Addr)
 	if err != nil {
@@ -118,8 +120,9 @@ func (s *Sink) WithTimestamp(int64) metrics.MetricSink {
 
 // ---------- statsdScoped ----------
 
-func (ss *statsdScoped) Start() {}
-func (ss *statsdScoped) Stop()  {}
+func (ss *statsdScoped) Name() string { return ss.root.Name() }
+func (ss *statsdScoped) Start()       {}
+func (ss *statsdScoped) Stop()        {}
 
 func (ss *statsdScoped) Gauge(name, unit string, value float64, tags metrics.Tags) {
 	ss.root.send(formatLine(ss.root.buildName(name, unit), value, "g", metrics.MergeTags(ss.base, tags)))

@@ -21,6 +21,7 @@ func TestMergeTags(t *testing.T) {
 
 type _dummySink struct{ called *bool }
 
+func (d _dummySink) Name() string                        { return "dummy" }
 func (d _dummySink) Start()                              {}
 func (d _dummySink) Stop()                               {}
 func (d _dummySink) Gauge(string, string, float64, Tags) {}

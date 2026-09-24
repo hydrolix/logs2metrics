@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -18,13 +19,15 @@ import (
 )
 
 type Client struct {
-	name       string
-	token      string
-	sinks      sinks.MetricSinks
-	selfSink   sinks.MetricSink // scoped sink for collector self-metrics
-	opts       HydrolixOpts
-	config     *QueriesConfig
-	httpClient *http.Client
+	name               string
+	token              string
+	sinks              sinks.MetricSinks
+	selfSink           sinks.MetricSink // scoped sink for collector self-metrics
+	opts               HydrolixOpts
+	config             *QueriesConfig
+	userAgentBase      string
+	queriesAreEmbedded bool
+	httpClient         *http.Client
 
 	mu      sync.RWMutex
 	closeCh chan struct{}
@@ -83,14 +86,16 @@ func New(name string, o HydrolixOpts, ms ...sinks.MetricSink) *Client {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
-		name:       name,
-		opts:       o,
-		config:     cfg,
-		closeCh:    make(chan struct{}),
-		sinks:      ms,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		ctx:        ctx,
-		cancel:     cancel,
+		name:               name,
+		opts:               o,
+		config:             cfg,
+		closeCh:            make(chan struct{}),
+		sinks:              ms,
+		httpClient:         &http.Client{Timeout: 30 * time.Second},
+		userAgentBase:      newAdminCommentBase(o.IntervalSeconds, sinks.MetricSinks(ms).Name()),
+		queriesAreEmbedded: o.ConfigPath == "",
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 	c.selfSink = c.sinks.WithTags(sinks.Tags{"component": "hydrolix-collector"})
 
@@ -263,7 +268,7 @@ func (c *Client) pollQuery(q *QueryConfig) {
 
 	slog.Debug("Polling query", "name", q.Name)
 
-	body, err := c.Query(q.RenderedSQL())
+	body, err := c.Query(q.Name, q.RenderedSQL())
 	if err != nil {
 		slog.Error("Failed to query Hydrolix", "query", q.Name, "error", err)
 		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
@@ -371,8 +376,10 @@ func (c *Client) UpdateToken(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) Query(sql string) (string, error) {
-	url := fmt.Sprintf("https://%s/query/", c.opts.Host)
+func (c *Client) Query(queryName, sql string) (string, error) {
+	url := fmt.Sprintf("https://%s/query?%s", c.opts.Host, url.Values{
+		"hdx_query_admin_comment": {c.userAgentAdminComment(queryName)},
+	}.Encode())
 
 	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, url, strings.NewReader(sql))
 	if err != nil {

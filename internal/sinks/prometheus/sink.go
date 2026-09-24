@@ -87,6 +87,8 @@ func NewSink(opts PromOpts) *PromScoped {
 	return &PromScoped{p: core, base: nil}
 }
 
+func (s *PromScoped) Name() string { return "prometheus" }
+
 // Start launches the self-hosted HTTP server exposing /sinks.
 // It returns immediately; errors are swallowed by design. Call Stop() to shutdown.
 func (s *PromScoped) Start() {

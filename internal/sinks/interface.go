@@ -1,6 +1,7 @@
 package sinks
 
 import (
+	"strings"
 	"time"
 )
 
@@ -8,7 +9,8 @@ type Tags map[string]string
 
 // MetricSink is the tiny surface your clients depend on.
 type MetricSink interface {
-	Start() // support for buffering and timers
+	Name() string // sink type, e.g. "prometheus"
+	Start()       // support for buffering and timers
 	Stop()
 	Gauge(name, unit string, value float64, tags Tags) // gauges (set)
 	Inc(name, unit string, value float64, tags Tags)   // counter
@@ -49,6 +51,7 @@ func MergeTags(a, b Tags) Tags {
 type Nop struct{ base Tags }
 
 func NewNop(base Tags) Nop                      { return Nop{base: base} }
+func (Nop) Name() string                        { return "nop" }
 func (Nop) Start()                              {}
 func (Nop) Stop()                               {}
 func (Nop) Gauge(string, string, float64, Tags) {}
@@ -59,6 +62,15 @@ func (n Nop) WithTags(t Tags) MetricSink        { return Nop{base: MergeTags(n.b
 func (n Nop) WithTimestamp(int64) MetricSink    { return Nop{base: n.base} }
 
 type MetricSinks []MetricSink
+
+// Name returns the names of the sinks, comma-separated, in configured order.
+func (ms MetricSinks) Name() string {
+	names := make([]string, len(ms))
+	for i, s := range ms {
+		names[i] = s.Name()
+	}
+	return strings.Join(names, ",")
+}
 
 func (ms MetricSinks) Gauge(name string, unit string, value float64, tags Tags) {
 	for _, s := range ms {

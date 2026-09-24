@@ -48,8 +48,9 @@ type datadogScoped struct {
 	base      metrics.Tags
 }
 
-func (s *datadogScoped) Start() {}
-func (s *datadogScoped) Stop()  {}
+func (s *datadogScoped) Name() string { return s.root.Name() }
+func (s *datadogScoped) Start()       {}
+func (s *datadogScoped) Stop()        {}
 func (s *datadogScoped) WithTags(t metrics.Tags) metrics.MetricSink {
 	return &datadogScoped{root: s.root, timestamp: s.timestamp, base: metrics.MergeTags(s.base, t)}
 }
@@ -92,6 +93,8 @@ type DatadogOpts struct {
 	// Must NOT be the DataDog sink itself — use Prometheus or Nop (default).
 	SelfSink metrics.MetricSink
 }
+
+func (dd *Sink) Name() string { return "datadog" }
 
 func NewSink(o DatadogOpts) *Sink {
 	self := o.SelfSink

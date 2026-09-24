@@ -84,8 +84,9 @@ type OTelScoped struct {
 	ts   *time.Time // optional override (stored as attributes)
 }
 
-func (s *OTelScoped) Start() { s.c.start() }
-func (s *OTelScoped) Stop()  { _ = s.c.stop(context.Background()) }
+func (s *OTelScoped) Name() string { return "otel" }
+func (s *OTelScoped) Start()       { s.c.start() }
+func (s *OTelScoped) Stop()        { _ = s.c.stop(context.Background()) }
 
 func (s *OTelScoped) WithTags(t sinks.Tags) sinks.MetricSink {
 	return &OTelScoped{c: s.c, base: mergeTags(s.base, t), ts: s.ts}
