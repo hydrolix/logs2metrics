@@ -98,3 +98,27 @@ func TestStopDeliversBufferedMetrics(t *testing.T) {
 		t.Error("buffered metrics were dropped at shutdown: no payload reached the sender")
 	}
 }
+
+// Metrics still queued in metricCh when Stop is called must be delivered, not
+// left behind: once Stop returns the channel is closed and anything in it is
+// lost. Collectors race the stop signal, so a single run can pass by luck;
+// repeat it with no sleep so a collector that exits without draining the
+// channel is caught.
+func TestStopDrainsQueuedMetrics(t *testing.T) {
+	const runs, submitted = 50, 200
+	for run := range runs {
+		var counts sync.Map
+		s := newTestSink(&counts, 2)
+		for i := range submitted {
+			s.Gauge("m", "unit", float64(i), nil)
+		}
+		s.Stop()
+
+		if dropped := loadCount(&counts, "hydrolix.sink.metrics_dropped"); dropped != 0 {
+			t.Fatalf("run %d: %d metrics dropped on submit; the test needs them all queued", run, dropped)
+		}
+		if left := len(s.metricCh); left != 0 {
+			t.Fatalf("run %d: %d of %d metrics left undelivered in metricCh after Stop", run, left, submitted)
+		}
+	}
+}
