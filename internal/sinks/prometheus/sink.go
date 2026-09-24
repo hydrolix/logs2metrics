@@ -39,6 +39,9 @@ type promCore struct {
 	ln      net.Listener
 	running bool
 	srvWg   sync.WaitGroup
+
+	healthPath    string
+	healthHandler http.Handler
 }
 
 // PromScoped is the user-facing handle (implements MetricSink) and can also start/stop its own server.
@@ -114,6 +117,15 @@ func (s *PromScoped) WithTags(t sinks.Tags) sinks.MetricSink {
 // Handler returns a http.Handler that serves metrics for embedding in your own server.
 func (s *PromScoped) Handler() http.Handler {
 	return promhttp.HandlerFor(s.p.reg, promhttp.HandlerOpts{})
+}
+
+// SetHealthCheck mounts h at path on this sink's HTTP server. Call before
+// Start(); it has no effect on a server that's already running.
+func (s *PromScoped) SetHealthCheck(path string, h http.Handler) {
+	s.p.srvMu.Lock()
+	defer s.p.srvMu.Unlock()
+	s.p.healthPath = path
+	s.p.healthHandler = h
 }
 
 // Metric implementations -------------------------------------------------------
@@ -300,6 +312,10 @@ func (p *promCore) startHTTP() {
 	// mux with /metrics
 	mux := http.NewServeMux()
 	mux.Handle(path, promhttp.HandlerFor(p.reg, promhttp.HandlerOpts{}))
+
+	if p.healthPath != "" && p.healthHandler != nil {
+		mux.Handle(p.healthPath, p.healthHandler)
+	}
 
 	// listener
 	ln, err := net.Listen("tcp", addr)

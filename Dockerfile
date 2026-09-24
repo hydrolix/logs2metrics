@@ -19,4 +19,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 FROM alpine:3.21
 WORKDIR /root/
 COPY --from=builder /home/metrics/hydrolix-collector .
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -q -O- http://127.0.0.1:2112/healthz || exit 1
+
 CMD ["./hydrolix-collector"]

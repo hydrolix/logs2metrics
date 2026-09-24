@@ -258,6 +258,58 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 	_ = os.Setenv("TZ", "UTC")
 }
 
+func TestHealthyReflectsPollerStateAndAuthFailures(t *testing.T) {
+	var status int32 = http.StatusOK
+	mux := http.NewServeMux()
+	mux.HandleFunc("/query/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(status))
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sink := newCaptureSink()
+	c := &Client{
+		opts:       HydrolixOpts{Host: srv.Listener.Addr().String()},
+		httpClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+		ctx:        ctx,
+		config: &QueriesConfig{
+			Queries: []QueryConfig{{Name: "q1", renderedSQL: "select 1"}},
+		},
+	}
+	c.selfSink = sink
+
+	// Not started yet: unhealthy regardless of poll outcome.
+	if c.Healthy() {
+		t.Fatal("expected client to be unhealthy before Start")
+	}
+
+	c.started.Store(true)
+	if !c.Healthy() {
+		t.Fatal("expected client to be healthy once started with no failed rounds")
+	}
+
+	status = http.StatusUnauthorized
+	c.pollAll()
+	if c.Healthy() {
+		t.Fatal("expected client to be unhealthy after an all-auth-error round")
+	}
+
+	status = http.StatusOK
+	c.pollAll()
+	if !c.Healthy() {
+		t.Fatal("expected client to recover to healthy after a successful round")
+	}
+
+	c.started.Store(false)
+	if c.Healthy() {
+		t.Fatal("expected client to be unhealthy after Stop")
+	}
+}
+
 // ---------- Test helpers ----------
 
 // testConfigsFS returns an os.DirFS pointing at the project root so tests

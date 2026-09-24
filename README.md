@@ -21,9 +21,10 @@ Flags:
   -e, --environment string             environment that the exporter runs in (default "dev")
   -f, --flush int32                    how frequently the metric sinks should export metrics in seconds (default 15)
       --healthz string                 healthcheck endpoint path (default "/healthz")
+      --healthz-addr string            address for the healthcheck listener; ignored when the prometheus sink is enabled, which serves healthz on its own port (default ":2112")
   -h, --help                           help for hydrolix-collector
   -i, --interval int32                 polling interval in seconds for the exporter, how frequently the exporter polls (default 15)
-  -n, --namespace string               override metric namespace, default uses command
+  -n, --namespace string               override metric namespace, default uses "hydrolix"
       --offset-end-minutes int         override lag offset in minutes for the query window end (0 = use config default)
       --offset-start-minutes int       override how many minutes back the query window starts (0 = use config default)
   -c, --config string                  path to queries.yaml config file (default: embedded config)
@@ -53,6 +54,29 @@ The collector reads Hydrolix credentials from environment variables:
 | `HDX_USERNAME` | Username (used if token not set)             |
 | `HDX_PASSWORD` | Password (used if token not set)             |
 
+### Datadog sink credentials
+
+When running with `--sink datadog`, the Datadog API client reads its own
+credentials from environment variables (there is no corresponding CLI flag):
+
+| Variable     | Description                                              |
+|--------------|-----------------------------------------------------------|
+| `DD_API_KEY` | Datadog API key (required)                               |
+| `DD_SITE`    | Datadog site, e.g. `datadoghq.com`, `datadoghq.eu` (optional; defaults to `datadoghq.com`) |
+
+## Deployment notes
+
+### Single replica only
+
+The poller has no leader election or other cross-instance coordination.
+Running two or more instances against the same Hydrolix host and query
+config causes problems: duplicate queries hit Hydrolix unnecessarily, the
+push sinks (Datadog, StatsD, OTel) receive double-counted metrics, and the
+Prometheus sink gets confused by multiple scrape targets exposing identical
+series. Run exactly one replica per configuration. See `DESIGN.md` for why
+this is safe in practice — the query window's backfill makes short restarts
+self-healing without needing a second replica for availability.
+
 ## Build the Go Binary
 
 ```bash
@@ -79,6 +103,28 @@ docker compose up
 | Prometheus           | http://localhost:9090   |
 | Grafana              | http://localhost:3000   |
 | Collector metrics    | http://localhost:2112/metrics |
+| Collector health     | http://localhost:2112/healthz |
+
+## Health Monitoring
+
+The collector exposes an HTTP health endpoint (path from `--healthz`, default
+`/healthz`) that returns `200` while the poller loop is running and the most
+recent poll round didn't fail with auth errors on every query, and `503`
+otherwise (for example, an expired or invalid token).
+
+This narrowly targets the auth-dead failure mode, not "is the collector
+working" in general: connectivity failures, server-side errors, and
+malformed responses do **not** flip it to `503` as long as at least one
+query in the round didn't fail on auth specifically. Alert separately on the
+`hydrolix.collector.poll` self-metric (`status=error` vs `status=success`)
+for those cases.
+
+### Docker / Compose
+
+The image ships a `HEALTHCHECK` instruction, and the example
+`docker-compose.yml` declares the same check, surfacing the result as
+`healthy`/`unhealthy` in `docker ps` / `docker compose ps` on a fixed
+interval.
 
 ## Query Configuration
 

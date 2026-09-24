@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mercereau/hydrolix-metrics-go/internal/common"
@@ -35,6 +37,19 @@ type Client struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
+
+	started                atomic.Bool // true while the poller loop (Start) is running
+	lastRoundAllAuthFailed atomic.Bool // true if every query in the most recent poll round failed with an auth error
+}
+
+// QueryError represents a non-2xx response from the Hydrolix query endpoint.
+type QueryError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *QueryError) Error() string {
+	return fmt.Sprintf("query failed: status=%d body=%s", e.StatusCode, e.Body)
 }
 
 type HydrolixOpts struct {
@@ -214,6 +229,9 @@ func (c *Client) Start() {
 
 	slog.Info("Starting Hydrolix poller", "interval", pollingInterval, "queries", len(c.config.Queries))
 
+	c.started.Store(true)
+	defer c.started.Store(false)
+
 	// Poll immediately on start.
 	c.pollAll()
 
@@ -228,16 +246,28 @@ func (c *Client) Start() {
 	}
 }
 
+// Healthy reports whether the collector is fit to serve traffic: the poller
+// loop is running, and it isn't stuck in an auth-dead state where every query
+// in the last round failed with an authentication/authorization error.
+func (c *Client) Healthy() bool {
+	return c.started.Load() && !c.lastRoundAllAuthFailed.Load()
+}
+
 // pollAll fans out all configured queries concurrently.
 func (c *Client) pollAll() {
+	n := len(c.config.Queries)
+	if n == 0 {
+		c.lastRoundAllAuthFailed.Store(false)
+		return
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(len(c.config.Queries))
+	authFailed := make([]bool, n)
 
 	for i := range c.config.Queries {
-		go func(q *QueryConfig) {
-			defer wg.Done()
-			c.pollQuery(q)
-		}(&c.config.Queries[i])
+		wg.Go(func() {
+			authFailed[i] = c.pollQuery(&c.config.Queries[i])
+		})
 	}
 
 	done := make(chan struct{})
@@ -250,15 +280,26 @@ func (c *Client) pollAll() {
 	case <-done:
 	case <-c.ctx.Done():
 		slog.Debug("Context cancelled while waiting for polls to complete")
+		return
 	}
+
+	allAuthFailed := true
+	for _, f := range authFailed {
+		if !f {
+			allAuthFailed = false
+			break
+		}
+	}
+	c.lastRoundAllAuthFailed.Store(allAuthFailed)
 }
 
-// pollQuery executes a single configured query and emits metrics.
-func (c *Client) pollQuery(q *QueryConfig) {
+// pollQuery executes a single configured query and emits metrics. It returns
+// true if the query failed with an authentication/authorization error.
+func (c *Client) pollQuery(q *QueryConfig) bool {
 	select {
 	case <-c.ctx.Done():
 		slog.Debug("Skipping poll - context cancelled", "query", q.Name)
-		return
+		return false
 	default:
 	}
 
@@ -272,14 +313,16 @@ func (c *Client) pollQuery(q *QueryConfig) {
 	if err != nil {
 		slog.Error("Failed to query Hydrolix", "query", q.Name, "error", err)
 		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
-		return
+		var qerr *QueryError
+		return errors.As(err, &qerr) &&
+			(qerr.StatusCode == http.StatusUnauthorized || qerr.StatusCode == http.StatusForbidden)
 	}
 
 	var resp GenericResponse
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		slog.Error("Failed to unmarshal response", "query", q.Name, "error", err)
 		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
-		return
+		return false
 	}
 
 	c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "success"}))
@@ -288,6 +331,7 @@ func (c *Client) pollQuery(q *QueryConfig) {
 	emitMetrics(q, &resp, c.config.Defaults.Tags, c.sinks)
 
 	slog.Debug("Completed polling", "query", q.Name, "rows", len(resp.Data))
+	return false
 }
 
 // Stop signals all listeners that we're shutting down.
@@ -406,7 +450,7 @@ func (c *Client) Query(queryName, sql string) (string, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("query failed: status=%d body=%s", resp.StatusCode, string(body))
+		return "", &QueryError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	return string(body), nil
