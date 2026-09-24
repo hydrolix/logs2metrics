@@ -59,6 +59,21 @@ func (e *QueryError) Error() string {
 	return fmt.Sprintf("query failed: status=%d body=%s", e.StatusCode, e.Body)
 }
 
+// AuthFailed reports whether the server refused the request's credentials:
+// a rejected token, or a 403.
+func (e *QueryError) AuthFailed() bool {
+	return tokenRejected(e.StatusCode, e.Body) || e.StatusCode == http.StatusForbidden
+}
+
+// tokenRejected reports whether a /query response rejected the bearer token.
+// Hydrolix answers an invalid or expired token with a 400 carrying ClickHouse
+// code 516 (AUTHENTICATION_FAILED) rather than a 401; a gateway in front of
+// the cluster may still send a 401.
+func tokenRejected(status int, body string) bool {
+	return status == http.StatusUnauthorized ||
+		(status == http.StatusBadRequest && strings.Contains(body, "AUTHENTICATION_FAILED"))
+}
+
 type HydrolixOpts struct {
 	Host               string
 	Username           string
@@ -339,8 +354,7 @@ func (c *Client) pollQuery(q *QueryConfig) bool {
 		slog.Error("Failed to query Hydrolix", "query", q.Name, "error", err)
 		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
 		var qerr *QueryError
-		return errors.As(err, &qerr) &&
-			(qerr.StatusCode == http.StatusUnauthorized || qerr.StatusCode == http.StatusForbidden)
+		return errors.As(err, &qerr) && qerr.AuthFailed()
 	}
 
 	var resp GenericResponse
@@ -498,9 +512,9 @@ func (c *Client) Query(queryName, sql string) (string, error) {
 		return "", err
 	}
 
-	if status == http.StatusUnauthorized {
-		// Both failures below wrap the 401 as a *QueryError so health checks
-		// still recognise them as auth failures.
+	if tokenRejected(status, body) {
+		// Both failures below wrap the rejection as a *QueryError so health
+		// checks still recognise them as auth failures.
 		qerr := &QueryError{StatusCode: status, Body: body}
 		if c.opts.Username == "" || c.opts.Password == "" {
 			return "", fmt.Errorf("the static token was rejected (invalid or expired) and the collector has no credentials to refresh it - provide a valid HDX_TOKEN, or HDX_USERNAME/HDX_PASSWORD: %w", qerr)

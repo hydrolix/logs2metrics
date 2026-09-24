@@ -259,10 +259,11 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 
 func TestHealthyReflectsPollerStateAndAuthFailures(t *testing.T) {
 	var status int32 = http.StatusOK
+	body := `{"data":[]}`
 	mux := http.NewServeMux()
-	mux.HandleFunc("/query/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(int(status))
-		_, _ = w.Write([]byte(`{"data":[]}`))
+		_, _ = w.Write([]byte(body))
 	})
 	srv := httptest.NewTLSServer(mux)
 	defer srv.Close()
@@ -302,6 +303,22 @@ func TestHealthyReflectsPollerStateAndAuthFailures(t *testing.T) {
 	if !c.Healthy() {
 		t.Fatal("expected client to recover to healthy after a successful round")
 	}
+
+	// qe-3 rejects a bad token with 400 + ClickHouse AUTHENTICATION_FAILED,
+	// not 401: that is an auth failure too.
+	status, body = http.StatusBadRequest, authFailedBody
+	c.pollAll()
+	if c.Healthy() {
+		t.Fatal("expected client to be unhealthy after an all-400-AUTHENTICATION_FAILED round")
+	}
+
+	// Any other 400 (e.g. bad SQL) is a query failure, not an auth failure.
+	status, body = http.StatusBadRequest, syntaxErrBody
+	c.pollAll()
+	if !c.Healthy() {
+		t.Fatal("a round of non-auth 400s must not mark the client unhealthy")
+	}
+	status, body = http.StatusOK, `{"data":[]}`
 
 	c.started.Store(false)
 	if c.Healthy() {
