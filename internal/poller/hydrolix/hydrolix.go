@@ -76,20 +76,12 @@ type loginRequest struct {
 	Password string `json:"password,omitempty"`
 }
 
-// loginResponse accepts both login shapes: real clusters nest the token under
-// auth_token, while a bare access_token is kept for compatibility.
+// loginResponse is the login endpoint's reply; clusters nest the token under
+// auth_token.
 type loginResponse struct {
-	AccessToken string `json:"access_token"`
-	AuthToken   struct {
+	AuthToken struct {
 		AccessToken string `json:"access_token"`
 	} `json:"auth_token"`
-}
-
-func (lr loginResponse) token() string {
-	if lr.AuthToken.AccessToken != "" {
-		return lr.AuthToken.AccessToken
-	}
-	return lr.AccessToken
 }
 
 func New(name string, o HydrolixOpts, ms ...sinks.MetricSink) *Client {
@@ -119,14 +111,6 @@ func New(name string, o HydrolixOpts, ms ...sinks.MetricSink) *Client {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	// Release the context if construction fails below.
-	built := false
-	defer func() {
-		if !built {
-			cancel()
-		}
-	}()
 	c := &Client{
 		name:               name,
 		opts:               o,
@@ -136,8 +120,6 @@ func New(name string, o HydrolixOpts, ms ...sinks.MetricSink) *Client {
 		httpClient:         &http.Client{Timeout: 30 * time.Second},
 		userAgentBase:      newAdminCommentBase(o.IntervalSeconds, sinks.MetricSinks(ms).Name()),
 		queriesAreEmbedded: o.ConfigPath == "",
-		ctx:                ctx,
-		cancel:             cancel,
 	}
 	c.selfSink = c.sinks.WithTags(sinks.Tags{"component": "hydrolix-collector"})
 
@@ -179,6 +161,7 @@ func New(name string, o HydrolixOpts, ms ...sinks.MetricSink) *Client {
 	// Authenticate. Both username/password sources (opts and environment)
 	// take the same path: log in now, fail construction if that fails, and
 	// keep the token fresh in the background.
+	refresh := false
 	switch {
 	case o.Token != "":
 		slog.Info("Using token instead of username/password")
@@ -189,12 +172,18 @@ func New(name string, o HydrolixOpts, ms ...sinks.MetricSink) *Client {
 			slog.Error("Initial login failed", "error", err)
 			return nil
 		}
-		c.wg.Go(c.refreshToken)
+		refresh = true
 	default:
 		slog.Error("No authentication method provided for Hydrolix Client")
 		return nil
 	}
-	built = true
+
+	// Construction has succeeded; only now create the context and start the
+	// background refresh, so no failure path above has anything to release.
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	if refresh {
+		c.wg.Go(c.refreshToken)
+	}
 	return c
 }
 
@@ -459,11 +448,11 @@ func (c *Client) fetchToken(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(body, &lr); err != nil {
 		return "", fmt.Errorf("unmarshal login response: %w", err)
 	}
-	if lr.token() == "" {
-		return "", fmt.Errorf("login response missing access_token")
+	if lr.AuthToken.AccessToken == "" {
+		return "", fmt.Errorf("login response missing auth_token.access_token")
 	}
 
-	return lr.token(), nil
+	return lr.AuthToken.AccessToken, nil
 }
 
 // reloginCooldown is how long a failed re-login is reused before the next

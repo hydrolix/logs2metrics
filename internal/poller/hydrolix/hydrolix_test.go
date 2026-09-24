@@ -3,7 +3,6 @@ package hydrolix
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -196,7 +195,7 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/config/v1/login/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(loginResponse{AccessToken: "test-token"})
+		_, _ = w.Write([]byte(`{"auth_token":{"access_token":"test-token"}}`))
 	})
 	var gotAdminComment, gotMethod string
 	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
