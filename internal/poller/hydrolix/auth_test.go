@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -258,6 +259,82 @@ func TestReloginAfter401SkipsWhenTokenAlreadyRefreshed(t *testing.T) {
 	}
 	if got := a.logins.Load(); got != loginsAfterNew {
 		t.Fatalf("guard should skip the login, got %d extra", got-loginsAfterNew)
+	}
+}
+
+// A password that stops working must not cost one failed login per rejected
+// query: concurrent 401s after a failed login reuse that failure, and every
+// caller still gets a 401 *QueryError for health checks.
+func TestFailedReloginIsRateLimited(t *testing.T) {
+	a := newAuthTestServer(t)
+	setAuthEnv(t, a.host(), "", "user", "pass")
+
+	c := New("test", newOpts())
+	if c == nil {
+		t.Fatal("New returned nil")
+	}
+	defer c.cancel()
+
+	a.rejectToken.Store("token-1")               // the current token is rejected
+	a.loginStatus.Store(http.StatusUnauthorized) // and the password no longer works
+	loginsBefore := a.logins.Load()
+
+	const queries = 5
+	errs := make([]error, queries)
+	var wg sync.WaitGroup
+	for i := range queries {
+		wg.Go(func() { _, errs[i] = c.Query("test_query", "select 1") })
+	}
+	wg.Wait()
+
+	if got := a.logins.Load() - loginsBefore; got != 1 {
+		t.Fatalf("expected 1 login attempt for %d concurrent 401s, got %d", queries, got)
+	}
+	for i, err := range errs {
+		var qerr *QueryError
+		if !errors.As(err, &qerr) || qerr.StatusCode != http.StatusUnauthorized {
+			t.Errorf("query %d: error should wrap a 401 *QueryError, got: %v", i, err)
+		}
+	}
+}
+
+// Once the cooldown has passed, the next 401 tries to log in again, so the
+// collector recovers by itself when the password is fixed.
+func TestReloginRetriesAfterCooldown(t *testing.T) {
+	orig := reloginCooldown
+	reloginCooldown = 50 * time.Millisecond
+	t.Cleanup(func() { reloginCooldown = orig })
+
+	a := newAuthTestServer(t)
+	setAuthEnv(t, a.host(), "", "user", "pass")
+
+	c := New("test", newOpts())
+	if c == nil {
+		t.Fatal("New returned nil")
+	}
+	defer c.cancel()
+
+	a.rejectToken.Store("token-1")
+	a.loginStatus.Store(http.StatusUnauthorized)
+	loginsBefore := a.logins.Load()
+
+	if _, err := c.Query("test_query", "select 1"); err == nil {
+		t.Fatal("expected an error while the password is rejected")
+	}
+	if _, err := c.Query("test_query", "select 1"); err == nil {
+		t.Fatal("expected an error within the cooldown")
+	}
+	if got := a.logins.Load() - loginsBefore; got != 1 {
+		t.Fatalf("expected 1 login attempt within the cooldown, got %d", got)
+	}
+
+	a.loginStatus.Store(http.StatusOK) // password fixed
+	time.Sleep(2 * reloginCooldown)
+	if _, err := c.Query("test_query", "select 1"); err != nil {
+		t.Fatalf("expected recovery after the cooldown, got: %v", err)
+	}
+	if got := a.logins.Load() - loginsBefore; got != 2 {
+		t.Fatalf("expected a second login attempt after the cooldown, got %d total", got)
 	}
 }
 

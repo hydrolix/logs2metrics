@@ -33,6 +33,12 @@ type Client struct {
 
 	mu      sync.RWMutex
 	loginMu sync.Mutex // serializes re-logins triggered by 401 responses
+
+	// Guarded by loginMu: the most recent failed re-login, reused during
+	// reloginCooldown instead of logging in again.
+	lastLoginErr      error
+	lastLoginFailedAt time.Time
+
 	closeCh chan struct{}
 	closed  bool
 	ctx     context.Context
@@ -460,18 +466,34 @@ func (c *Client) fetchToken(ctx context.Context) (string, error) {
 	return lr.token(), nil
 }
 
+// reloginCooldown is how long a failed re-login is reused before the next
+// attempt. Without it, a rotated or disabled password would cost one failed
+// login per query per poll, which can trip an account lockout.
+var reloginCooldown = time.Minute
+
 // reloginAfter401 refreshes the token after a query was rejected with 401.
 // Logins are serialized, and if another goroutine already replaced the token
 // the caller just retries with that one - so a burst of concurrent 401s
-// produces a single login, not a stampede.
+// produces a single login, not a stampede. A failed login is reused for
+// reloginCooldown, so failures are rate-limited the same way.
 func (c *Client) reloginAfter401(ctx context.Context, usedToken string) error {
 	c.loginMu.Lock()
 	defer c.loginMu.Unlock()
 	if c.currentToken() != usedToken {
 		return nil // someone else already refreshed it
 	}
+	if c.lastLoginErr != nil {
+		if since := time.Since(c.lastLoginFailedAt); since < reloginCooldown {
+			return fmt.Errorf("not retrying login, last attempt %s ago failed: %w", since.Round(time.Second), c.lastLoginErr)
+		}
+	}
 	slog.Warn("Query rejected with 401; re-logging in")
-	return c.UpdateToken(ctx)
+	if err := c.UpdateToken(ctx); err != nil {
+		c.lastLoginErr, c.lastLoginFailedAt = err, time.Now()
+		return err
+	}
+	c.lastLoginErr = nil
+	return nil
 }
 
 func (c *Client) currentToken() string {
