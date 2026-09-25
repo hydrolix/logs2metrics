@@ -49,7 +49,7 @@ type OTelOpts struct {
 	// Temporality preference: "delta" (default) or "cumulative".
 	Temporality string
 
-	// SelfSink receives internal health metrics (gauge evictions).
+	// SelfSink receives internal health metrics (gauge export failures).
 	// Must NOT be this OTel sink itself — use Prometheus or Nop (default).
 	SelfSink sinks.MetricSink
 }
@@ -80,7 +80,7 @@ func NewOTelSink(opts OTelOpts) *OTelScoped {
 type OTelScoped struct {
 	c    *otelCore
 	base sinks.Tags
-	ts   *time.Time // optional override (stored as attributes)
+	ts   *time.Time // event time: gauge datapoint timestamp; event_time_* attributes on counters and timings
 }
 
 func (s *OTelScoped) Name() string { return "otel" }
@@ -209,36 +209,14 @@ func (c *otelCore) start() {
 		ts = DeltaTemporalitySelector
 	}
 
-	newExporter := func() (sdkmetric.Exporter, error) {
-		switch strings.ToLower(c.opts.Protocol) {
-		case "http", "http/protobuf", "http_protobuf":
-			clientOpts := []otlpmetrichttp.Option{}
-			if c.opts.Endpoint != "" {
-				clientOpts = append(clientOpts, otlpmetrichttp.WithEndpoint(c.opts.Endpoint))
-			}
-			clientOpts = append(clientOpts, otlpmetrichttp.WithTemporalitySelector(ts))
-			return otlpmetrichttp.New(context.Background(), clientOpts...)
-		default: // gRPC
-			clientOpts := []otlpmetricgrpc.Option{}
-			if c.opts.Endpoint != "" {
-				clientOpts = append(clientOpts, otlpmetricgrpc.WithEndpoint(c.opts.Endpoint))
-			}
-			if c.opts.Insecure {
-				clientOpts = append(clientOpts, otlpmetricgrpc.WithInsecure())
-			}
-			clientOpts = append(clientOpts, otlpmetricgrpc.WithTemporalitySelector(ts))
-			return otlpmetricgrpc.New(context.Background(), clientOpts...)
-		}
-	}
-
 	// Build both exporters before constructing anything stateful, so a
 	// failure here leaves no reader goroutine or global provider behind.
-	exp, err := newExporter()
+	exp, err := newExporter(c.opts, ts)
 	if err != nil {
 		// In your project, handle/log the error as needed.
 		return
 	}
-	gaugeExp, err := newExporter()
+	gaugeExp, err := newExporter(c.opts, ts)
 	if err != nil {
 		_ = exp.Shutdown(context.Background())
 		return
@@ -296,12 +274,37 @@ func (c *otelCore) flushGauges(ctx context.Context) {
 			Metrics: metrics,
 		}},
 	}
-	// No retry: the sliding window re-polls the same buckets within one
-	// interval, so a failed flush re-buffers itself; only the final flush at
-	// shutdown is lossy on error, and that is reported below.
+	// drain has already emptied the buffer, so a failed export drops these
+	// points; beyond the OTLP exporter's own retries, they come back only if
+	// a later poll re-reads their bucket (a window wider than one poll
+	// interval). Each failure is counted and logged below.
 	if err := c.gaugeExp.Export(ctx, rm); err != nil {
 		c.self.Inc("hydrolix.sink.send_failures", "total", 1, nil)
 		slog.Error("Failed to export gauge metrics", "error", err)
+	}
+}
+
+// newExporter builds the OTLP exporter for opts. It is a variable so tests
+// can substitute an in-memory exporter.
+var newExporter = func(opts OTelOpts, ts sdkmetric.TemporalitySelector) (sdkmetric.Exporter, error) {
+	switch strings.ToLower(opts.Protocol) {
+	case "http", "http/protobuf", "http_protobuf":
+		clientOpts := []otlpmetrichttp.Option{}
+		if opts.Endpoint != "" {
+			clientOpts = append(clientOpts, otlpmetrichttp.WithEndpoint(opts.Endpoint))
+		}
+		clientOpts = append(clientOpts, otlpmetrichttp.WithTemporalitySelector(ts))
+		return otlpmetrichttp.New(context.Background(), clientOpts...)
+	default: // gRPC
+		clientOpts := []otlpmetricgrpc.Option{}
+		if opts.Endpoint != "" {
+			clientOpts = append(clientOpts, otlpmetricgrpc.WithEndpoint(opts.Endpoint))
+		}
+		if opts.Insecure {
+			clientOpts = append(clientOpts, otlpmetricgrpc.WithInsecure())
+		}
+		clientOpts = append(clientOpts, otlpmetricgrpc.WithTemporalitySelector(ts))
+		return otlpmetricgrpc.New(context.Background(), clientOpts...)
 	}
 }
 
@@ -333,7 +336,7 @@ func (c *otelCore) stop(ctx context.Context) error {
 type iKey struct {
 	name string
 	unit string
-	kind string // "counter", "updown", "hist"
+	kind string // "counter", "hist"
 }
 
 func (c *otelCore) getCounter(m metric.Meter, k iKey) metric.Float64Counter {
