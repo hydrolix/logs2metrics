@@ -1,0 +1,48 @@
+name: Release image
+
+# To release: on main, with the Makefile's BASE_VERSION at vX.Y.Z, push an
+# annotated tag with release notes as its message:
+#   git tag -a vX.Y.Z-hdx.N -m "<notes>" && git push origin vX.Y.Z-hdx.N
+# N starts at 1 for each new BASE_VERSION.
+
+on:
+  push:
+    tags:
+      # -hdx.N: fork build, not semver pre-release
+      - "v[0-9]+.[0-9]+.[0-9]+-hdx.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prove-main:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # origin/main, for the on-main check
+      - name: Check tag is annotated, on main, and matches BASE_VERSION
+        shell: bash
+        run: bash .github/scripts/release-version.sh check-tag "$GITHUB_REF_NAME"
+
+  test:
+    name: Test
+    needs: prove-main
+    uses: ./.github/workflows/_test.yml
+
+  image:
+    name: Image
+    needs: [prove-main, test]
+    uses: ./.github/workflows/_build-push-image.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: release
+      version: ${{ github.ref_name }}
+      tags: ${{ github.ref_name }} latest

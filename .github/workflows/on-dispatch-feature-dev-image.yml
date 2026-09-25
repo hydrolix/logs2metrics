@@ -1,0 +1,52 @@
+name: Dev image (feature branch)
+
+# Manually publish any branch to the dev image path as branch-<name>-<sha7>.
+# Shares the dev environment, which is why dev has no branch restriction.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-image-feature-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tags: ${{ steps.version.outputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compute feature version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" != "branch" ]]; then
+            echo "::error::run this workflow from a branch, not a $GITHUB_REF_TYPE"
+            exit 1
+          fi
+          base="$(bash .github/scripts/release-version.sh base)"
+          sha7="${GITHUB_SHA::7}"
+          branch="$(sed 's/[^a-zA-Z0-9._-]/-/g' <<< "$GITHUB_REF_NAME")"
+          echo "version=${base}-hdx-dev.${sha7}" >> "$GITHUB_OUTPUT"
+          echo "tags=branch-${branch:0:100}-${sha7}" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: Image
+    needs: version
+    uses: ./.github/workflows/_build-push-image.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: dev
+      version: ${{ needs.version.outputs.version }}
+      tags: ${{ needs.version.outputs.tags }}

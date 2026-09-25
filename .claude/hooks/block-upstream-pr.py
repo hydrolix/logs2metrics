@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse guard: agents may open PRs only against hydrolix/metrics-exporter.
+"""PreToolUse guard: agents may open PRs only against hydrolix/logs2metrics.
 
 This repo is a GitHub fork of mercereau/hydrolix-metrics-go, so both the
 GitHub web UI and a bare `gh pr create` default the PR base to that parent.
@@ -9,10 +9,10 @@ hook keeps an agent from doing it by accident.
 Covers two surfaces:
 
 1. Bash: `gh pr create` must name its target with `--repo`/`-R` (or
-   `GH_REPO=`), and that target must be hydrolix/metrics-exporter.
+   `GH_REPO=`), and that target must be hydrolix/logs2metrics.
 2. MCP: any tool whose name ends in `create_pull_request` (the GitHub MCP
    servers take `owner`/`repo` parameters) must target
-   hydrolix/metrics-exporter.
+   hydrolix/logs2metrics.
 
 Exit codes: 0 allows the call; 2 blocks it and shows stderr to the agent.
 Any other failure (bad payload, missing python3) fails open.
@@ -25,7 +25,7 @@ import re
 import sys
 
 ALLOWED_OWNER = "hydrolix"
-ALLOWED_REPO = "metrics-exporter"
+ALLOWED_REPO = "logs2metrics"
 ALLOWED_SLUG = f"{ALLOWED_OWNER}/{ALLOWED_REPO}"
 FORK_PARENT = "mercereau/hydrolix-metrics-go"
 
