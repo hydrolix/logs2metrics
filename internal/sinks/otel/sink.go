@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -48,7 +49,7 @@ type OTelOpts struct {
 	// Temporality preference: "delta" (default) or "cumulative".
 	Temporality string
 
-	// SelfSink receives internal health metrics (gauge evictions).
+	// SelfSink receives internal health metrics (gauge export failures).
 	// Must NOT be this OTel sink itself — use Prometheus or Nop (default).
 	SelfSink sinks.MetricSink
 }
@@ -65,13 +66,11 @@ func NewOTelSink(opts OTelOpts) *OTelScoped {
 		self = sinks.NewNop(nil)
 	}
 	core := &otelCore{
-		opts:          opts,
-		counters:      map[iKey]metric.Float64Counter{},
-		updowns:       map[iKey]metric.Float64UpDownCounter{},
-		histograms:    map[iKey]metric.Float64Histogram{},
-		gaugePrev:     map[string]float64{},
-		gaugePrevTime: map[string]time.Time{},
-		self:          self.WithTags(sinks.Tags{"sink": "otel"}),
+		opts:       opts,
+		counters:   map[iKey]metric.Float64Counter{},
+		histograms: map[iKey]metric.Float64Histogram{},
+		gauges:     newGaugeBuffer(),
+		self:       self.WithTags(sinks.Tags{"sink": "otel"}),
 	}
 	return &OTelScoped{c: core}
 }
@@ -81,7 +80,7 @@ func NewOTelSink(opts OTelOpts) *OTelScoped {
 type OTelScoped struct {
 	c    *otelCore
 	base sinks.Tags
-	ts   *time.Time // optional override (stored as attributes)
+	ts   *time.Time // event time: gauge datapoint timestamp; event_time_* attributes on counters and timings
 }
 
 func (s *OTelScoped) Name() string { return "otel" }
@@ -120,25 +119,16 @@ func (s *OTelScoped) Rate(name, unit string, value float64, tags sinks.Tags) {
 }
 
 func (s *OTelScoped) Gauge(name, unit string, value float64, tags sinks.Tags) {
-	// Emulate "set" using UpDownCounter: delta = new - prev for this timeseries.
+	// Gauges are exported as OTLP Gauge datapoints carrying the query's value
+	// and the event timestamp, so overlapping-window re-polls overwrite rather
+	// than accumulate. See gaugeBuffer for why this bypasses the SDK Meter.
 	s.c.ensureStarted()
-	meter := s.c.meter
 
-	allTags := mergeTags(s.base, tags)
-	seriesKey := seriesKey(sanitizeName(name), sanitizeUnit(unit), allTags)
-
-	prev := s.c.getGaugePrev(seriesKey)
-	delta := value - prev
-	s.c.setGaugePrev(seriesKey, value)
-
-	key := iKey{name: sanitizeName(name), unit: sanitizeUnit(unit), kind: "updown"}
-	inst := s.c.getUpDown(meter, key)
-
-	at := attrsFromTags(allTags)
+	t := time.Now()
 	if s.ts != nil {
-		at = appendEventTimeAttrs(at, *s.ts)
+		t = *s.ts
 	}
-	inst.Add(context.Background(), delta, metric.WithAttributes(at...))
+	s.c.gauges.add(sanitizeName(name), sanitizeUnit(unit), attrsFromTags(mergeTags(s.base, tags)), t, value)
 }
 
 func (s *OTelScoped) Timing(name string, d time.Duration, tags sinks.Tags) {
@@ -171,14 +161,15 @@ type otelCore struct {
 	// instruments cached by (name, unit, kind)
 	insMu      sync.RWMutex
 	counters   map[iKey]metric.Float64Counter
-	updowns    map[iKey]metric.Float64UpDownCounter
 	histograms map[iKey]metric.Float64Histogram
 
-	// gauge state per series key
-	gMu              sync.Mutex
-	gaugePrev        map[string]float64
-	gaugePrevTime    map[string]time.Time
-	gaugeCleanupStop chan struct{}
+	// gauge export: hand-built datapoints flushed on the export interval
+	// through a dedicated exporter (the PeriodicReader owns exp exclusively).
+	gauges    *gaugeBuffer
+	gaugeExp  sdkmetric.Exporter
+	gaugeRes  *resource.Resource
+	gaugeStop chan struct{}
+	gaugeDone chan struct{}
 
 	self sinks.MetricSink // sink for self-monitoring metrics
 }
@@ -210,10 +201,6 @@ func (c *otelCore) start() {
 	)
 
 	// Exporter (temporality set here, not on PeriodicReader)
-	var (
-		exp sdkmetric.Exporter
-		err error
-	)
 	temporal := strings.ToLower(c.opts.Temporality)
 	var ts sdkmetric.TemporalitySelector
 	if temporal == "cumulative" {
@@ -222,27 +209,16 @@ func (c *otelCore) start() {
 		ts = DeltaTemporalitySelector
 	}
 
-	switch strings.ToLower(c.opts.Protocol) {
-	case "http", "http/protobuf", "http_protobuf":
-		clientOpts := []otlpmetrichttp.Option{}
-		if c.opts.Endpoint != "" {
-			clientOpts = append(clientOpts, otlpmetrichttp.WithEndpoint(c.opts.Endpoint))
-		}
-		clientOpts = append(clientOpts, otlpmetrichttp.WithTemporalitySelector(ts))
-		exp, err = otlpmetrichttp.New(context.Background(), clientOpts...)
-	default: // gRPC
-		clientOpts := []otlpmetricgrpc.Option{}
-		if c.opts.Endpoint != "" {
-			clientOpts = append(clientOpts, otlpmetricgrpc.WithEndpoint(c.opts.Endpoint))
-		}
-		if c.opts.Insecure {
-			clientOpts = append(clientOpts, otlpmetricgrpc.WithInsecure())
-		}
-		clientOpts = append(clientOpts, otlpmetricgrpc.WithTemporalitySelector(ts))
-		exp, err = otlpmetricgrpc.New(context.Background(), clientOpts...)
-	}
+	// Build both exporters before constructing anything stateful, so a
+	// failure here leaves no reader goroutine or global provider behind.
+	exp, err := newExporter(c.opts, ts)
 	if err != nil {
 		// In your project, handle/log the error as needed.
+		return
+	}
+	gaugeExp, err := newExporter(c.opts, ts)
+	if err != nil {
+		_ = exp.Shutdown(context.Background())
 		return
 	}
 
@@ -261,9 +237,75 @@ func (c *otelCore) start() {
 	c.reader = reader
 	c.mp = mp
 	c.meter = meter
-	c.gaugeCleanupStop = make(chan struct{})
+	c.gaugeExp = gaugeExp
+	c.gaugeRes = res
+	c.gaugeStop = make(chan struct{})
+	c.gaugeDone = make(chan struct{})
 	c.started = true
-	go c.cleanupGaugePrev(5 * time.Minute)
+	go c.runGaugeFlusher()
+}
+
+// runGaugeFlusher exports buffered gauge datapoints on the export interval,
+// with a final flush at shutdown.
+func (c *otelCore) runGaugeFlusher() {
+	defer close(c.gaugeDone)
+	ticker := time.NewTicker(c.opts.ExportInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.gaugeStop:
+			c.flushGauges(context.Background())
+			return
+		case <-ticker.C:
+			c.flushGauges(context.Background())
+		}
+	}
+}
+
+func (c *otelCore) flushGauges(ctx context.Context) {
+	metrics := c.gauges.drain()
+	if len(metrics) == 0 {
+		return
+	}
+	rm := &metricdata.ResourceMetrics{
+		Resource: c.gaugeRes,
+		ScopeMetrics: []metricdata.ScopeMetrics{{
+			Scope:   instrumentation.Scope{Name: "cdn-metrics"},
+			Metrics: metrics,
+		}},
+	}
+	// drain has already emptied the buffer, so a failed export drops these
+	// points; beyond the OTLP exporter's own retries, they come back only if
+	// a later poll re-reads their bucket (a window wider than one poll
+	// interval). Each failure is counted and logged below.
+	if err := c.gaugeExp.Export(ctx, rm); err != nil {
+		c.self.Inc("hydrolix.sink.send_failures", "total", 1, nil)
+		slog.Error("Failed to export gauge metrics", "error", err)
+	}
+}
+
+// newExporter builds the OTLP exporter for opts. It is a variable so tests
+// can substitute an in-memory exporter.
+var newExporter = func(opts OTelOpts, ts sdkmetric.TemporalitySelector) (sdkmetric.Exporter, error) {
+	switch strings.ToLower(opts.Protocol) {
+	case "http", "http/protobuf", "http_protobuf":
+		clientOpts := []otlpmetrichttp.Option{}
+		if opts.Endpoint != "" {
+			clientOpts = append(clientOpts, otlpmetrichttp.WithEndpoint(opts.Endpoint))
+		}
+		clientOpts = append(clientOpts, otlpmetrichttp.WithTemporalitySelector(ts))
+		return otlpmetrichttp.New(context.Background(), clientOpts...)
+	default: // gRPC
+		clientOpts := []otlpmetricgrpc.Option{}
+		if opts.Endpoint != "" {
+			clientOpts = append(clientOpts, otlpmetricgrpc.WithEndpoint(opts.Endpoint))
+		}
+		if opts.Insecure {
+			clientOpts = append(clientOpts, otlpmetricgrpc.WithInsecure())
+		}
+		clientOpts = append(clientOpts, otlpmetricgrpc.WithTemporalitySelector(ts))
+		return otlpmetricgrpc.New(context.Background(), clientOpts...)
+	}
 }
 
 func (c *otelCore) ensureStarted() { c.start() }
@@ -274,13 +316,19 @@ func (c *otelCore) stop(ctx context.Context) error {
 	if !c.started {
 		return nil
 	}
-	close(c.gaugeCleanupStop)
-	err := c.mp.Shutdown(ctx) // flushes and closes exporter
+	close(c.gaugeStop)
+	<-c.gaugeDone // final gauge flush has run
+	gaugeErr := c.gaugeExp.Shutdown(ctx)
+	err := c.mp.Shutdown(ctx) // flushes and closes the reader's exporter
 	c.started = false
 	c.exp = nil
 	c.reader = nil
 	c.mp = nil
 	c.meter = nil // interface zero
+	c.gaugeExp = nil
+	if err == nil {
+		err = gaugeErr
+	}
 	return err
 }
 
@@ -288,7 +336,7 @@ func (c *otelCore) stop(ctx context.Context) error {
 type iKey struct {
 	name string
 	unit string
-	kind string // "counter", "updown", "hist"
+	kind string // "counter", "hist"
 }
 
 func (c *otelCore) getCounter(m metric.Meter, k iKey) metric.Float64Counter {
@@ -308,23 +356,6 @@ func (c *otelCore) getCounter(m metric.Meter, k iKey) metric.Float64Counter {
 	return i
 }
 
-func (c *otelCore) getUpDown(m metric.Meter, k iKey) metric.Float64UpDownCounter {
-	c.insMu.RLock()
-	inst, ok := c.updowns[k]
-	c.insMu.RUnlock()
-	if ok {
-		return inst
-	}
-	c.insMu.Lock()
-	defer c.insMu.Unlock()
-	if inst, ok = c.updowns[k]; ok {
-		return inst
-	}
-	i, _ := m.Float64UpDownCounter(k.name, metric.WithUnit(k.unit), metric.WithDescription(k.name))
-	c.updowns[k] = i
-	return i
-}
-
 func (c *otelCore) getHistogram(m metric.Meter, k iKey) metric.Float64Histogram {
 	c.insMu.RLock()
 	inst, ok := c.histograms[k]
@@ -340,43 +371,6 @@ func (c *otelCore) getHistogram(m metric.Meter, k iKey) metric.Float64Histogram 
 	i, _ := m.Float64Histogram(k.name, metric.WithUnit(k.unit), metric.WithDescription(k.name))
 	c.histograms[k] = i
 	return i
-}
-
-// gauge state (set semantics using updowncounter)
-func (c *otelCore) getGaugePrev(series string) float64 {
-	c.gMu.Lock()
-	defer c.gMu.Unlock()
-	return c.gaugePrev[series]
-}
-func (c *otelCore) setGaugePrev(series string, v float64) {
-	c.gMu.Lock()
-	c.gaugePrev[series] = v
-	c.gaugePrevTime[series] = time.Now()
-	c.gMu.Unlock()
-}
-
-// cleanupGaugePrev removes gauge state entries that haven't been updated within ttl.
-func (c *otelCore) cleanupGaugePrev(ttl time.Duration) {
-	ticker := time.NewTicker(ttl / 2)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.gaugeCleanupStop:
-			return
-		case <-ticker.C:
-			cutoff := time.Now().Add(-ttl)
-			c.gMu.Lock()
-			for k, t := range c.gaugePrevTime {
-				if t.Before(cutoff) {
-					delete(c.gaugePrev, k)
-					delete(c.gaugePrevTime, k)
-					c.self.Inc("hydrolix.sink.gauge_evictions", "total", 1, nil)
-					slog.Debug("evicted stale gauge state; next observation will emit full value as delta", "series", k)
-				}
-			}
-			c.gMu.Unlock()
-		}
-	}
 }
 
 // -------- helpers --------
@@ -402,29 +396,6 @@ func appendEventTimeAttrs(in []attribute.KeyValue, t time.Time) []attribute.KeyV
 		attribute.Int64("event_time_unix", t.Unix()),
 		attribute.Int64("event_time_ms", t.UnixMilli()),
 	)
-}
-
-func seriesKey(name, unit string, t sinks.Tags) string {
-	if len(t) == 0 {
-		return name + "|" + unit
-	}
-	keys := make([]string, 0, len(t))
-	for k := range t {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	b.Grow(len(name) + len(unit) + len(keys)*8)
-	b.WriteString(name)
-	b.WriteString("|")
-	b.WriteString(unit)
-	for _, k := range keys {
-		b.WriteString("|")
-		b.WriteString(k)
-		b.WriteString("=")
-		b.WriteString(t[k])
-	}
-	return b.String()
 }
 
 func mergeTags(a, b sinks.Tags) sinks.Tags {
