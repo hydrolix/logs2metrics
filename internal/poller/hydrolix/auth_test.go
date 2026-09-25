@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,14 +21,25 @@ type authTestServer struct {
 	logins      atomic.Int64
 	loginStatus atomic.Int64 // response code for /config/v1/login/ (default 200)
 	queryAuth   chan string  // Authorization header seen by /query
-	rejectToken atomic.Value // string; queries carrying this token get a 401
+	rejectToken atomic.Value // string; queries carrying this token are rejected
+	rejectWith  atomic.Int64 // status for rejected tokens: 400 (qe-3's real response, default) or 401
+	rejectAll   atomic.Bool  // reject every token, including freshly issued ones
 }
+
+// Bodies as returned by qe-innovations-3 on /query (captured 2026-09-24,
+// trimmed). A rejected bearer token is a 400 carrying ClickHouse code 516,
+// not a 401.
+const (
+	authFailedBody = `{"error": "Code: 516. DB::Exception: : Authentication failed: password is incorrect, or there is no user with such name. (AUTHENTICATION_FAILED)", "query": "select 1"}`
+	syntaxErrBody  = `{"error": "Code: 62. DB::Exception: Syntax error: failed at position 1 (broken): broken. Expected one of: Query, Query with output, EXPLAIN, SELECT query. (SYNTAX_ERROR)", "query": "broken"}`
+)
 
 func newAuthTestServer(t *testing.T) *authTestServer {
 	t.Helper()
 	a := &authTestServer{queryAuth: make(chan string, 64)}
 	a.loginStatus.Store(http.StatusOK)
 	a.rejectToken.Store("")
+	a.rejectWith.Store(http.StatusBadRequest)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/config/v1/login/", func(w http.ResponseWriter, r *http.Request) {
@@ -43,8 +55,18 @@ func newAuthTestServer(t *testing.T) *authTestServer {
 	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		a.queryAuth <- auth
-		if bad := a.rejectToken.Load().(string); bad != "" && auth == "Bearer "+bad {
-			w.WriteHeader(http.StatusUnauthorized)
+		if bad := a.rejectToken.Load().(string); a.rejectAll.Load() || (bad != "" && auth == "Bearer "+bad) {
+			if a.rejectWith.Load() == http.StatusUnauthorized {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(authFailedBody))
+			return
+		}
+		if sql, _ := io.ReadAll(r.Body); strings.Contains(string(sql), "broken") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(syntaxErrBody))
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -180,8 +202,10 @@ func TestNewOptsUserPassKeepsFetchedToken(t *testing.T) {
 	}
 }
 
-// In user/pass mode a 401 means the token expired: re-login once and retry.
-func TestQueryReloginOn401(t *testing.T) {
+// In user/pass mode a rejected token means it expired or was invalidated:
+// re-login once and retry. The stub rejects it the way qe-3 does (400 +
+// AUTHENTICATION_FAILED), not with a 401.
+func TestQueryReloginOnRejectedToken(t *testing.T) {
 	a := newAuthTestServer(t)
 	setAuthEnv(t, a.host(), "", "user", "pass")
 
@@ -193,7 +217,7 @@ func TestQueryReloginOn401(t *testing.T) {
 	a.rejectToken.Store("token-1") // simulate expiry of the initial token
 
 	if _, err := c.Query("test_query", "select 1"); err != nil {
-		t.Fatalf("Query should recover from a 401 via re-login, got: %v", err)
+		t.Fatalf("Query should recover from a rejected token via re-login, got: %v", err)
 	}
 	if got := a.logins.Load(); got != 2 {
 		t.Fatalf("expected initial login + one re-login, got %d logins", got)
@@ -223,13 +247,12 @@ func TestQuery401WithStaticTokenIsHardError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error for a rejected static token")
 	}
-	if !strings.Contains(err.Error(), "token") {
-		t.Fatalf("error should say the token was rejected, got: %v", err)
+	if !strings.Contains(err.Error(), "static token was rejected") {
+		t.Fatalf("error should say the static token was rejected, got: %v", err)
 	}
-	// Health checks classify auth failures by unwrapping a *QueryError.
 	var qerr *QueryError
-	if !errors.As(err, &qerr) || qerr.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("error should wrap a 401 *QueryError, got: %v", err)
+	if !errors.As(err, &qerr) {
+		t.Fatalf("error should wrap the server's *QueryError, got: %v", err)
 	}
 	if got := a.logins.Load(); got != 0 {
 		t.Fatalf("static-token mode must not attempt a login, got %d", got)
@@ -292,8 +315,8 @@ func TestFailedReloginIsRateLimited(t *testing.T) {
 	}
 	for i, err := range errs {
 		var qerr *QueryError
-		if !errors.As(err, &qerr) || qerr.StatusCode != http.StatusUnauthorized {
-			t.Errorf("query %d: error should wrap a 401 *QueryError, got: %v", i, err)
+		if !errors.As(err, &qerr) {
+			t.Errorf("query %d: error should wrap the server's *QueryError, got: %v", i, err)
 		}
 	}
 }
@@ -358,5 +381,88 @@ func TestNewOptsHostWithEnvToken(t *testing.T) {
 	}
 	if auth := <-a.queryAuth; auth != "Bearer env-token" {
 		t.Fatalf("query sent %q, want the env token", auth)
+	}
+}
+
+// A gateway in front of a cluster may answer a rejected token with a plain
+// 401; that must still trigger the re-login.
+func TestQueryReloginOnPlain401(t *testing.T) {
+	a := newAuthTestServer(t)
+	a.rejectWith.Store(http.StatusUnauthorized)
+	setAuthEnv(t, a.host(), "", "user", "pass")
+
+	c := New("test", newOpts())
+	if c == nil {
+		t.Fatal("New returned nil")
+	}
+	defer c.cancel()
+	a.rejectToken.Store("token-1")
+
+	if _, err := c.Query("test_query", "select 1"); err != nil {
+		t.Fatalf("Query should recover from a 401 via re-login, got: %v", err)
+	}
+	if got := a.logins.Load(); got != 2 {
+		t.Fatalf("expected initial login + one re-login, got %d logins", got)
+	}
+}
+
+// A 400 that is not an auth failure (bad SQL) must not trigger a re-login.
+func TestQueryNonAuth400DoesNotRelogin(t *testing.T) {
+	a := newAuthTestServer(t)
+	setAuthEnv(t, a.host(), "", "user", "pass")
+
+	c := New("test", newOpts())
+	if c == nil {
+		t.Fatal("New returned nil")
+	}
+	defer c.cancel()
+	loginsBefore := a.logins.Load()
+
+	_, err := c.Query("test_query", "broken")
+	var qerr *QueryError
+	if !errors.As(err, &qerr) || qerr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected the 400 *QueryError back, got: %v", err)
+	}
+	if got := a.logins.Load() - loginsBefore; got != 0 {
+		t.Fatalf("a syntax error must not trigger a re-login, got %d", got)
+	}
+}
+
+// If a freshly issued token is rejected too (e.g. the account may log in but
+// not query), logging in again cannot help: re-login must fall under the same
+// cooldown as a failed login instead of running once per query.
+func TestReloginRateLimitedWhenFreshTokenAlsoRejected(t *testing.T) {
+	a := newAuthTestServer(t)
+	setAuthEnv(t, a.host(), "", "user", "pass")
+
+	c := New("test", newOpts())
+	if c == nil {
+		t.Fatal("New returned nil")
+	}
+	defer c.cancel()
+	a.rejectAll.Store(true)
+
+	for range 10 {
+		_, err := c.Query("test_query", "select 1")
+		var qerr *QueryError
+		if !errors.As(err, &qerr) || !qerr.AuthFailed() {
+			t.Fatalf("expected an auth-failure *QueryError, got: %v", err)
+		}
+	}
+	if got := a.logins.Load(); got != 2 {
+		t.Fatalf("expected initial login + one re-login across 10 rejected queries, got %d logins", got)
+	}
+}
+
+// Hydrolix echoes the SQL in the error body - in the "query" field and inside
+// the ClickHouse message itself (shape captured from qe-3, 2026-09-24) - so
+// only the leading error code may decide whether the token was rejected.
+func TestTokenRejectedIgnoresEchoedQueryText(t *testing.T) {
+	body := `{"error": "Code: 62. DB::Exception: Syntax error: failed at position 1 (broken): broken 'AUTHENTICATION_FAILED'. Expected one of: Query, Query with output, EXPLAIN, SELECT query. (SYNTAX_ERROR)", "query": "broken 'AUTHENTICATION_FAILED'"}`
+	if tokenRejected(http.StatusBadRequest, body) {
+		t.Fatal("a syntax error whose echoed query mentions AUTHENTICATION_FAILED is not a rejected token")
+	}
+	if !tokenRejected(http.StatusBadRequest, authFailedBody) {
+		t.Fatal("qe-3's 516 body must still count as a rejected token")
 	}
 }
