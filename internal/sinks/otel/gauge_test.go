@@ -86,7 +86,9 @@ func TestGaugeBufferGroupsByNameAndDrains(t *testing.T) {
 // value, with dimension attributes only - no event_time_* attributes, and no
 // delta arithmetic against previous observations.
 func TestGaugeGoesToBufferWithEventTimeAndRawValue(t *testing.T) {
+	useMemExporter(t)
 	s := NewOTelSink(OTelOpts{Endpoint: "127.0.0.1:1", Insecure: true})
+	defer s.Stop()
 	ts := int64(1_788_372_780)
 	scoped := s.WithTimestamp(ts)
 
@@ -118,7 +120,9 @@ func TestGaugeGoesToBufferWithEventTimeAndRawValue(t *testing.T) {
 
 // Without WithTimestamp (self-metrics), the observation time is used.
 func TestGaugeWithoutTimestampUsesNow(t *testing.T) {
+	useMemExporter(t)
 	s := NewOTelSink(OTelOpts{Endpoint: "127.0.0.1:1", Insecure: true})
+	defer s.Stop()
 	before := time.Now().Add(-time.Second)
 
 	s.Gauge("self.metric", "row", 5, nil)
