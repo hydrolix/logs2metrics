@@ -1,0 +1,50 @@
+name: Dev image (main)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-image-main
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    uses: ./.github/workflows/_test.yml
+
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tags: ${{ steps.version.outputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # release tags, for the no-regression check
+          persist-credentials: false
+      - name: Compute dev version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(bash .github/scripts/release-version.sh check-main)"
+          sha7="${GITHUB_SHA::7}"
+          echo "version=${base}-hdx-dev.${sha7}" >> "$GITHUB_OUTPUT"
+          echo "tags=sha-${sha7} main" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: Image
+    needs: [test, version]
+    uses: ./.github/workflows/_build-push-image.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: dev
+      version: ${{ needs.version.outputs.version }}
+      tags: ${{ needs.version.outputs.tags }}

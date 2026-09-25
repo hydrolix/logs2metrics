@@ -1,0 +1,112 @@
+name: Build and push image
+
+# Builds upstream's Dockerfile unchanged: version info goes in through its
+# VERSION/COMMIT/DATE build args, provenance through OCI labels. The image
+# path and WIF identity come from the GitHub environment's variables.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment to deploy through (dev or release)
+        type: string
+        required: true
+      version:
+        description: Version stamped into the binary and the image label
+        type: string
+        required: true
+      tags:
+        description: Space-separated image tags to push
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build and push (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write  # mint the GitHub OIDC token exchanged for GCP credentials
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+      VERSION: ${{ inputs.version }}
+      TAGS: ${{ inputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate tags
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$IMAGE_REPOSITORY" ]] || { echo "::error::vars.IMAGE_REPOSITORY is not set in the $ENVIRONMENT environment"; exit 1; }
+          read -ra tags <<< "$TAGS"
+          [[ ${#tags[@]} -gt 0 ]] || { echo "::error::no tags given"; exit 1; }
+          for tag in "${tags[@]}"; do
+            [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "::error::'$tag' is not a valid docker tag"; exit 1; }
+            # Defense in depth: only release may move release tags, even if
+            # dev and release ever point at the same image path.
+            if [[ "$ENVIRONMENT" != "release" && ( "$tag" == v* || "$tag" == "latest" ) ]]; then
+              echo "::error::the $ENVIRONMENT environment may not push release tag '$tag'"
+              exit 1
+            fi
+          done
+          echo "first=${tags[0]}" >> "$GITHUB_OUTPUT"
+          echo "registry_host=${IMAGE_REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        shell: bash
+        run: |
+          set -euo pipefail
+          created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          tag_args=()
+          for tag in $TAGS; do tag_args+=(-t "$IMAGE_REPOSITORY:$tag"); done
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg VERSION="$VERSION" \
+            --build-arg COMMIT="${GITHUB_SHA::7}" \
+            --build-arg DATE="$created" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.version="$VERSION" \
+            --label org.opencontainers.image.created="$created" \
+            "${tag_args[@]}" \
+            --load .
+
+      - name: Check stamped version
+        shell: bash
+        env:
+          IMAGE: ${{ env.IMAGE_REPOSITORY }}:${{ steps.validate.outputs.first }}
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm "$IMAGE" ./hydrolix-collector version)"
+          echo "$out"
+          grep -qxF "version: $VERSION" <<< "$out" || { echo "::error::image reports a version other than $VERSION"; exit 1; }
+
+      - name: Authenticate GAR (Workload Identity Federation)
+        uses: ./.github/actions/setup-google-application-credentials
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
+          registry_host: ${{ steps.validate.outputs.registry_host }}
+
+      - name: Push image
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in $TAGS; do docker push "$IMAGE_REPOSITORY:$tag"; done
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REPOSITORY:${TAGS%% *}")"
+          {
+            echo "### Pushed \`$VERSION\` to $ENVIRONMENT"
+            echo
+            for tag in $TAGS; do echo "- \`$IMAGE_REPOSITORY:$tag\`"; done
+            echo
+            echo "Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

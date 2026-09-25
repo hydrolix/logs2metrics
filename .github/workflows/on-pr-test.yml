@@ -1,0 +1,19 @@
+name: PR tests
+
+# No cloud credentials or environments here: PRs, including ones from forks,
+# only build and test.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    uses: ./.github/workflows/_test.yml
