@@ -267,6 +267,22 @@ func (dd *Sink) runCollector() {
 	for {
 		select {
 		case <-dd.stopCollectorCh:
+			// Drain metrics still queued in metricCh before the final flush.
+			// submitMetric cannot enqueue once Stop has set closed, so the
+			// channel only shrinks from here and the loop terminates.
+		drain:
+			for {
+				select {
+				case m := <-dd.metricCh:
+					buffer = append(buffer, m)
+					if len(buffer) >= dd.opts.BatchSize {
+						dd.flush(buffer)
+						buffer = make([]datadogV2.MetricSeries, 0, dd.opts.BatchSize)
+					}
+				default:
+					break drain
+				}
+			}
 			dd.flush(buffer)
 			slog.Info("Collector stopping")
 			return
