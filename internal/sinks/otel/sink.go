@@ -221,6 +221,8 @@ func (c *otelCore) start() {
 		_ = exp.Shutdown(context.Background())
 		return
 	}
+	exp = countingExporter{Exporter: exp, self: c.self}
+	gaugeExp = countingExporter{Exporter: gaugeExp, self: c.self}
 
 	reader := sdkmetric.NewPeriodicReader(
 		exp,
@@ -306,6 +308,25 @@ var newExporter = func(opts OTelOpts, ts sdkmetric.TemporalitySelector) (sdkmetr
 		clientOpts = append(clientOpts, otlpmetricgrpc.WithTemporalitySelector(ts))
 		return otlpmetricgrpc.New(context.Background(), clientOpts...)
 	}
+}
+
+// countingExporter counts every export attempt on the self-sink as
+// hydrolix.sink.export{status=success|error}, so a sink that stops
+// delivering to its collector is visible without reading logs. The error
+// is returned unchanged.
+type countingExporter struct {
+	sdkmetric.Exporter
+	self sinks.MetricSink
+}
+
+func (e countingExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
+	err := e.Exporter.Export(ctx, rm)
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	e.self.Inc("hydrolix.sink.export", "total", 1, sinks.Tags{"status": status})
+	return err
 }
 
 func (c *otelCore) ensureStarted() { c.start() }
