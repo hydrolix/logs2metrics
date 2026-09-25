@@ -1,6 +1,6 @@
-# Claude project rules — metrics-exporter
+# Claude project rules — logs2metrics
 
-## PRs MUST target hydrolix/metrics-exporter
+## PRs MUST target hydrolix/logs2metrics
 
 This repository is a GitHub fork of `mercereau/hydrolix-metrics-go`. Because
 of that, both the GitHub web UI and `gh pr create` without an explicit
@@ -11,9 +11,9 @@ We do intend to contribute changes upstream, but only on purpose: a human
 decides and opens those PRs. An agent never does, and never by accident.
 
 **Rule:** every `gh pr create` invocation in this repo MUST include
-`--repo hydrolix/metrics-exporter` explicitly, and GitHub MCP
+`--repo hydrolix/logs2metrics` explicitly, and GitHub MCP
 `create_pull_request` calls MUST use `owner: hydrolix`,
-`repo: metrics-exporter`. Never open a PR against any other repository,
+`repo: logs2metrics`. Never open a PR against any other repository,
 including `mercereau/hydrolix-metrics-go` and contributors' forks.
 
 This rule applies in every permission mode. A `PreToolUse` hook at
