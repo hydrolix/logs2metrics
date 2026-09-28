@@ -304,7 +304,7 @@ func TestHealthyReflectsPollerStateAndAuthFailures(t *testing.T) {
 		t.Fatal("expected client to recover to healthy after a successful round")
 	}
 
-	// qe-3 rejects a bad token with 400 + ClickHouse AUTHENTICATION_FAILED,
+	// Hydrolix rejects a bad token with 400 + ClickHouse AUTHENTICATION_FAILED,
 	// not 401: that is an auth failure too.
 	status, body = http.StatusBadRequest, authFailedBody
 	c.pollAll()

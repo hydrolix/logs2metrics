@@ -22,11 +22,11 @@ type authTestServer struct {
 	loginStatus atomic.Int64 // response code for /config/v1/login/ (default 200)
 	queryAuth   chan string  // Authorization header seen by /query
 	rejectToken atomic.Value // string; queries carrying this token are rejected
-	rejectWith  atomic.Int64 // status for rejected tokens: 400 (qe-3's real response, default) or 401
+	rejectWith  atomic.Int64 // status for rejected tokens: 400 (a real cluster's response, default) or 401
 	rejectAll   atomic.Bool  // reject every token, including freshly issued ones
 }
 
-// Bodies as returned by qe-innovations-3 on /query (captured 2026-09-24,
+// Bodies as returned by a Hydrolix cluster on /query (captured 2026-09-24,
 // trimmed). A rejected bearer token is a 400 carrying ClickHouse code 516,
 // not a 401.
 const (
@@ -203,7 +203,7 @@ func TestNewOptsUserPassKeepsFetchedToken(t *testing.T) {
 }
 
 // In user/pass mode a rejected token means it expired or was invalidated:
-// re-login once and retry. The stub rejects it the way qe-3 does (400 +
+// re-login once and retry. The stub rejects it the way a real cluster does (400 +
 // AUTHENTICATION_FAILED), not with a 401.
 func TestQueryReloginOnRejectedToken(t *testing.T) {
 	a := newAuthTestServer(t)
@@ -455,7 +455,7 @@ func TestReloginRateLimitedWhenFreshTokenAlsoRejected(t *testing.T) {
 }
 
 // Hydrolix echoes the SQL in the error body - in the "query" field and inside
-// the ClickHouse message itself (shape captured from qe-3, 2026-09-24) - so
+// the ClickHouse message itself (shape captured from a real cluster, 2026-09-24) - so
 // only the leading error code may decide whether the token was rejected.
 func TestTokenRejectedIgnoresEchoedQueryText(t *testing.T) {
 	body := `{"error": "Code: 62. DB::Exception: Syntax error: failed at position 1 (broken): broken 'AUTHENTICATION_FAILED'. Expected one of: Query, Query with output, EXPLAIN, SELECT query. (SYNTAX_ERROR)", "query": "broken 'AUTHENTICATION_FAILED'"}`
@@ -463,6 +463,6 @@ func TestTokenRejectedIgnoresEchoedQueryText(t *testing.T) {
 		t.Fatal("a syntax error whose echoed query mentions AUTHENTICATION_FAILED is not a rejected token")
 	}
 	if !tokenRejected(http.StatusBadRequest, authFailedBody) {
-		t.Fatal("qe-3's 516 body must still count as a rejected token")
+		t.Fatal("the real 516 body must still count as a rejected token")
 	}
 }
