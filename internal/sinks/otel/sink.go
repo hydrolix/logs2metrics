@@ -4,7 +4,6 @@ package otel
 
 import (
 	"context"
-	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -13,7 +12,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -37,6 +35,10 @@ type OTelOpts struct {
 	// Export interval for the periodic reader (default 10s).
 	ExportInterval time.Duration
 
+	// Upper bound on each export, including the final one at shutdown
+	// (default: the SDK's 30s).
+	ExportTimeout time.Duration
+
 	// Resource info
 	ServiceName    string
 	ServiceVersion string
@@ -49,7 +51,7 @@ type OTelOpts struct {
 	// Temporality preference: "delta" (default) or "cumulative".
 	Temporality string
 
-	// SelfSink receives internal health metrics (gauge export failures).
+	// SelfSink receives internal health metrics.
 	// Must NOT be this OTel sink itself — use Prometheus or Nop (default).
 	SelfSink sinks.MetricSink
 }
@@ -163,13 +165,9 @@ type otelCore struct {
 	counters   map[iKey]metric.Float64Counter
 	histograms map[iKey]metric.Float64Histogram
 
-	// gauge export: hand-built datapoints flushed on the export interval
-	// through a dedicated exporter (the PeriodicReader owns exp exclusively).
-	gauges    *gaugeBuffer
-	gaugeExp  sdkmetric.Exporter
-	gaugeRes  *resource.Resource
-	gaugeStop chan struct{}
-	gaugeDone chan struct{}
+	// gauges holds hand-built datapoints; the reader drains it as an external
+	// producer on every collect.
+	gauges *gaugeBuffer
 
 	self sinks.MetricSink // sink for self-monitoring metrics
 }
@@ -209,23 +207,20 @@ func (c *otelCore) start() {
 		ts = DeltaTemporalitySelector
 	}
 
-	// Build both exporters before constructing anything stateful, so a
-	// failure here leaves no reader goroutine or global provider behind.
 	exp, err := newExporter(c.opts, ts)
 	if err != nil {
 		// In your project, handle/log the error as needed.
 		return
 	}
-	gaugeExp, err := newExporter(c.opts, ts)
-	if err != nil {
-		_ = exp.Shutdown(context.Background())
-		return
-	}
 
-	reader := sdkmetric.NewPeriodicReader(
-		exp,
+	readerOpts := []sdkmetric.PeriodicReaderOption{
 		sdkmetric.WithInterval(c.opts.ExportInterval),
-	)
+		sdkmetric.WithProducer(c.gauges),
+	}
+	if c.opts.ExportTimeout > 0 {
+		readerOpts = append(readerOpts, sdkmetric.WithTimeout(c.opts.ExportTimeout))
+	}
+	reader := sdkmetric.NewPeriodicReader(exp, readerOpts...)
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
@@ -237,51 +232,7 @@ func (c *otelCore) start() {
 	c.reader = reader
 	c.mp = mp
 	c.meter = meter
-	c.gaugeExp = gaugeExp
-	c.gaugeRes = res
-	c.gaugeStop = make(chan struct{})
-	c.gaugeDone = make(chan struct{})
 	c.started = true
-	go c.runGaugeFlusher()
-}
-
-// runGaugeFlusher exports buffered gauge datapoints on the export interval,
-// with a final flush at shutdown.
-func (c *otelCore) runGaugeFlusher() {
-	defer close(c.gaugeDone)
-	ticker := time.NewTicker(c.opts.ExportInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.gaugeStop:
-			c.flushGauges(context.Background())
-			return
-		case <-ticker.C:
-			c.flushGauges(context.Background())
-		}
-	}
-}
-
-func (c *otelCore) flushGauges(ctx context.Context) {
-	metrics := c.gauges.drain()
-	if len(metrics) == 0 {
-		return
-	}
-	rm := &metricdata.ResourceMetrics{
-		Resource: c.gaugeRes,
-		ScopeMetrics: []metricdata.ScopeMetrics{{
-			Scope:   instrumentation.Scope{Name: "cdn-metrics"},
-			Metrics: metrics,
-		}},
-	}
-	// drain has already emptied the buffer, so a failed export drops these
-	// points; beyond the OTLP exporter's own retries, they come back only if
-	// a later poll re-reads their bucket (a window wider than one poll
-	// interval). Each failure is counted and logged below.
-	if err := c.gaugeExp.Export(ctx, rm); err != nil {
-		c.self.Inc("hydrolix.sink.send_failures", "total", 1, nil)
-		slog.Error("Failed to export gauge metrics", "error", err)
-	}
 }
 
 // newExporter builds the OTLP exporter for opts. It is a variable so tests
@@ -316,19 +267,14 @@ func (c *otelCore) stop(ctx context.Context) error {
 	if !c.started {
 		return nil
 	}
-	close(c.gaugeStop)
-	<-c.gaugeDone // final gauge flush has run
-	gaugeErr := c.gaugeExp.Shutdown(ctx)
-	err := c.mp.Shutdown(ctx) // flushes and closes the reader's exporter
+	// Runs a final collect and export (buffered gauges included), bounded by
+	// the reader's timeout, then closes the exporter.
+	err := c.mp.Shutdown(ctx)
 	c.started = false
 	c.exp = nil
 	c.reader = nil
 	c.mp = nil
 	c.meter = nil // interface zero
-	c.gaugeExp = nil
-	if err == nil {
-		err = gaugeErr
-	}
 	return err
 }
 
