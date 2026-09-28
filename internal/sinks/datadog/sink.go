@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"net/http"
 	"sync"
 	"time"
 
@@ -339,20 +340,28 @@ func (dd *Sink) queuePayload(p datadogV2.MetricPayload) error {
 	}
 }
 
+// submitMetrics makes one SubmitMetrics call to the Datadog API. It is a
+// variable so tests can substitute a fake without HTTP.
+var submitMetrics = func(payload datadogV2.MetricPayload) (datadogV2.IntakePayloadAccepted, *http.Response, error) {
+	ctx := datadog.NewDefaultContext(context.Background())
+	configuration := datadog.NewConfiguration()
+	apiClient := datadog.NewAPIClient(configuration)
+	api := datadogV2.NewMetricsApi(apiClient)
+	return api.SubmitMetrics(ctx, payload, *datadogV2.NewSubmitMetricsOptionalParameters())
+}
+
 func (dd *Sink) sendToDatadog(payload datadogV2.MetricPayload) error {
 	for attempt := 0; attempt < dd.opts.MaxRetries; attempt++ {
 		if attempt > 0 {
 			dd.self.Inc("hydrolix.sink.send_retries", "total", 1, nil)
 		}
 
-		ctx := datadog.NewDefaultContext(context.Background())
-		configuration := datadog.NewConfiguration()
-		apiClient := datadog.NewAPIClient(configuration)
-		api := datadogV2.NewMetricsApi(apiClient)
-		resp, r, err := api.SubmitMetrics(ctx, payload, *datadogV2.NewSubmitMetricsOptionalParameters())
+		resp, r, err := submitMetrics(payload)
 
 		if err == nil && r.StatusCode < 300 {
 			dd.self.Inc("hydrolix.sink.payloads_sent", "total", 1, nil)
+			// Shared with the OTel sink: one export-outcome metric for all push sinks.
+			dd.self.Inc("hydrolix.sink.export", "total", 1, metrics.Tags{"status": "success"})
 			slog.Debug(fmt.Sprintf("Sent Metrics: %d, Status Code: %v", len(payload.Series), r.StatusCode))
 			if len(resp.Errors) > 0 {
 				slog.Error(fmt.Sprintf("Errors in response: %s", resp.Errors))
@@ -371,6 +380,7 @@ func (dd *Sink) sendToDatadog(payload datadogV2.MetricPayload) error {
 	}
 
 	dd.self.Inc("hydrolix.sink.send_failures", "total", 1, nil)
+	dd.self.Inc("hydrolix.sink.export", "total", 1, metrics.Tags{"status": "error"})
 	return errors.New("all retry attempts failed")
 }
 

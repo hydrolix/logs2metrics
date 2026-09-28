@@ -262,7 +262,8 @@ var newExporter = func(opts OTelOpts, ts sdkmetric.TemporalitySelector) (sdkmetr
 }
 
 // countingExporter counts every export attempt on the self-sink as
-// hydrolix.sink.export{status=success|error}, so a sink that stops
+// hydrolix.sink.export{status=success|error} (the export-outcome metric
+// shared with the Datadog sink), so a sink that stops
 // delivering to its collector is visible without reading logs, and logs each
 // failure at ERROR (the SDK's default error handler is silent). The error is
 // returned unchanged.
