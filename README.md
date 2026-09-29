@@ -117,7 +117,17 @@ working" in general: connectivity failures, server-side errors, and
 malformed responses do **not** flip it to `503` as long as at least one
 query in the round didn't fail on auth specifically. Alert separately on the
 `hydrolix.collector.poll` self-metric (`status=error` vs `status=success`)
-for those cases.
+for those cases. Error polls also carry a `reason` tag:
+
+| `reason`    | Meaning |
+|-------------|---------|
+| `auth`      | Hydrolix refused the credentials (rejected or expired token, 401, 403) |
+| `query`     | Any other non-200 response, such as bad SQL or a server error |
+| `transport` | No response at all: timeout, DNS, TLS or connection failure |
+| `decode`    | A 200 response that isn't valid JSON |
+
+`reason=auth` is the one to alert on for an expired token, from destinations
+that can't call the health endpoint.
 
 ### Docker / Compose
 

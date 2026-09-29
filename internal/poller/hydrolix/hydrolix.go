@@ -364,15 +364,15 @@ func (c *Client) pollQuery(q *QueryConfig) bool {
 	body, err := c.Query(q.Name, q.RenderedSQL())
 	if err != nil {
 		slog.Error("Failed to query Hydrolix", "query", q.Name, "error", err)
-		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
-		var qerr *QueryError
-		return errors.As(err, &qerr) && qerr.AuthFailed()
+		reason := queryErrorReason(err)
+		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error", "reason": reason}))
+		return reason == "auth"
 	}
 
 	var resp GenericResponse
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		slog.Error("Failed to unmarshal response", "query", q.Name, "error", err)
-		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
+		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error", "reason": "decode"}))
 		return false
 	}
 
@@ -383,6 +383,21 @@ func (c *Client) pollQuery(q *QueryConfig) bool {
 
 	slog.Debug("Completed polling", "query", q.Name, "rows", len(resp.Data))
 	return false
+}
+
+// queryErrorReason classifies a Query error for the reason tag of an error
+// poll: "auth" when Hydrolix refused the credentials, "query" for any other
+// non-200 response (bad SQL, server error), and "transport" when no response
+// arrived at all (timeout, DNS, TLS or connection failure).
+func queryErrorReason(err error) string {
+	var qerr *QueryError
+	if !errors.As(err, &qerr) {
+		return "transport"
+	}
+	if qerr.AuthFailed() {
+		return "auth"
+	}
+	return "query"
 }
 
 // Stop signals all listeners that we're shutting down.
