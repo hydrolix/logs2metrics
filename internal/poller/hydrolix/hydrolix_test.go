@@ -197,10 +197,11 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"auth_token":{"access_token":"test-token"}}`))
 	})
-	var gotAdminComment, gotMethod string
+	var gotAdminComment, gotNoCache, gotMethod string
 	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotAdminComment = r.URL.Query().Get("hdx_query_admin_comment")
+		gotNoCache = r.URL.Query().Get("no_cache")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
@@ -252,6 +253,9 @@ func TestUpdateTokenAndQueryWithTLSServer(t *testing.T) {
 	}
 	if want := "User: hydrolix-metrics-go query: test_query"; gotAdminComment != want {
 		t.Errorf("server received hdx_query_admin_comment = %q, want %q", gotAdminComment, want)
+	}
+	if gotNoCache != "1" {
+		t.Errorf("server received no_cache = %q, want \"1\" (http-proxy would otherwise serve cached poll results)", gotNoCache)
 	}
 
 	_ = os.Setenv("TZ", "UTC")
