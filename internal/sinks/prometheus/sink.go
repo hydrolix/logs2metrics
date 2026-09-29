@@ -247,36 +247,38 @@ func covers(labels []string, t sinks.Tags) bool {
 	return true
 }
 
-// labelsFor returns the label names for a metric name. The first write sets
-// them; a later write carrying keys not seen before widens them, and every
-// existing vector of that name is rebuilt (see widen). Missing keys are
-// written as "". The caller holds p.mu.
+// labelsFor returns the label names for a metric name, widening them (see
+// widen) when tags carry a key not seen before. Missing keys are written as
+// "". The caller holds p.mu.
 func (p *promCore) labelsFor(metricName string, tags sinks.Tags) []string {
-	keys := sortedKeys(tags)
 	cur, ok := p.labels[metricName]
 	if !ok {
-		p.labels[metricName] = keys
-		return keys
-	}
-	merged := unionSorted(cur, keys)
-	if len(merged) == len(cur) {
+		cur = sortedKeys(tags)
+		p.labels[metricName] = cur
 		return cur
 	}
+	if covers(cur, tags) {
+		return cur
+	}
+	all := make(sinks.Tags, len(cur)+len(tags))
+	for _, k := range cur {
+		all[k] = ""
+	}
+	for k := range tags {
+		all[k] = ""
+	}
+	merged := sortedKeys(all)
 	p.widen(metricName, merged)
 	p.labels[metricName] = merged
 	return merged
 }
 
 // widen rebuilds every vector named name with the label names in labels.
-// Counter and gauge series are carried over with "" for the new labels:
-// Prometheus treats an empty label as absent, so scrapers see the same series
-// with the same values, and a counter does not reset. Histogram observations
-// can't be restored through the client, so a histogram that gains a label
-// starts over. A carried-over counter does get a new created timestamp; only
-// Prometheus's opt-in created-timestamp-zero-ingestion (protobuf scrapes)
-// reads it, and would then see one reset at the widening. The new vector is
-// filled before it is swapped in, so a scrape never sees it half built. The
-// caller holds p.mu.
+// Counter and gauge series carry over with "" for the new labels, which
+// Prometheus stores as the same series, so nothing resets. Histograms can't
+// be restored and start over. A carried-over counter gets a new created
+// timestamp, seen only by opt-in created-timestamp ingestion. The caller
+// holds p.mu.
 func (p *promCore) widen(name string, labels []string) {
 	if cv := p.counters[name]; cv != nil {
 		nv := newCounterVec(name, labels)
@@ -301,12 +303,9 @@ func (p *promCore) widen(name string, labels []string) {
 	}
 }
 
-// slot is what the registry sees for one metric: it forwards collection to
-// the vector currently stored in it. The registry fixes a metric name's
-// label names for the life of the process, even across Unregister, so a
-// vector can't be re-registered with more labels; a slot declares no
-// descriptors (an "unchecked" collector), which lets widen swap the vector
-// behind it instead.
+// slot is registered once per metric name and forwards collection to its
+// current vector. The registry keeps a name's label names for the life of
+// the process, even across Unregister, so widen swaps the vector here.
 type slot struct {
 	kind string       // one metric type per name, as the registry enforced
 	cur  atomic.Value // holds the current vector (always the same Go type)
@@ -321,12 +320,10 @@ func (s *slot) Collect(ch chan<- prom.Metric) {
 }
 
 // publish makes c the vector scraped for name, registering its slot on
-// first use. Reusing a name for another metric type panics, as MustRegister
-// did before slots: slots declare no descriptors, so the registry no longer
-// catches it. For the same reason a name shared with a collector registered
-// outside the sink (e.g. go_* runtime metrics) fails the scrape instead of
-// panicking at registration; the namespace prefix keeps sink names apart.
-// The caller holds p.mu.
+// first use. Slots declare no descriptors, so the registry can't reject a
+// name reused for another metric type; publish panics instead, as
+// MustRegister did. (A clash with a collector outside the sink, e.g. go_*,
+// shows up at scrape time.) The caller holds p.mu.
 func (p *promCore) publish(kind, name string, c prom.Collector) {
 	sl := p.slots[name]
 	if sl == nil {
@@ -362,26 +359,6 @@ func widenedLabels(m *dto.Metric, labels []string) prom.Labels {
 	}
 	for _, lp := range m.GetLabel() {
 		out[lp.GetName()] = lp.GetValue()
-	}
-	return out
-}
-
-// unionSorted merges two sorted, duplicate-free lists.
-func unionSorted(a, b []string) []string {
-	out := make([]string, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) || j < len(b) {
-		switch {
-		case j == len(b) || (i < len(a) && a[i] < b[j]):
-			out = append(out, a[i])
-			i++
-		case i == len(a) || b[j] < a[i]:
-			out = append(out, b[j])
-			j++
-		default:
-			out = append(out, a[i])
-			i, j = i+1, j+1
-		}
 	}
 	return out
 }

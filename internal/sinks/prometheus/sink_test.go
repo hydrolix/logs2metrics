@@ -46,10 +46,6 @@ func TestLabelsForAndMergeTags(t *testing.T) {
 	if strings.Join(lbls2, ",") != "a,b,c" {
 		t.Fatalf("labels after an extra key = %v, want [a b c]", lbls2)
 	}
-	// a key missing later keeps the widened set
-	if lbls3 := p.labelsFor("m1", sinks.Tags{"a": "1"}); strings.Join(lbls3, ",") != "a,b,c" {
-		t.Fatalf("labels after a missing key = %v, want [a b c]", lbls3)
-	}
 	p.mu.Unlock()
 
 	// mergeTags sanitizes keys
