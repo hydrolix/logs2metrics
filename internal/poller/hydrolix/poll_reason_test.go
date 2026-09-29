@@ -83,3 +83,49 @@ func TestPollErrorsAreTaggedWithReason(t *testing.T) {
 		})
 	}
 }
+
+// With user/pass credentials a rejected token triggers a re-login, which
+// fails in two further shapes: the login itself fails, or the freshly issued
+// token is rejected too. Both are still auth failures.
+func TestReloginFailuresAreTaggedAuth(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(a *authTestServer)
+	}{
+		{name: "re-login fails", setup: func(a *authTestServer) {
+			a.rejectToken.Store("token-1")
+			a.loginStatus.Store(http.StatusUnauthorized)
+		}},
+		{name: "fresh token also rejected", setup: func(a *authTestServer) {
+			a.rejectAll.Store(true)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAuthTestServer(t)
+			setAuthEnv(t, a.host(), "", "user", "pass")
+			c := New("test", newOpts())
+			if c == nil {
+				t.Fatal("New returned nil")
+			}
+			defer c.cancel()
+			sink := newCaptureSink()
+			c.selfSink = sink
+			tc.setup(a)
+
+			if !c.pollQuery(&QueryConfig{Name: "q1", renderedSQL: "select 1"}) {
+				t.Error("pollQuery should report an auth failure")
+			}
+			for _, m := range sink.store.incs {
+				if m.name != "hydrolix.collector.poll" {
+					continue
+				}
+				if m.tags["status"] != "error" || m.tags["reason"] != "auth" {
+					t.Errorf("poll tags = %v, want status=error reason=auth", m.tags)
+				}
+				return
+			}
+			t.Fatal("no hydrolix.collector.poll count recorded")
+		})
+	}
+}

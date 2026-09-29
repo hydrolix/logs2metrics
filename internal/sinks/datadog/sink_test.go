@@ -2,8 +2,11 @@ package datadog
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	ddv2 "github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
 	"github.com/mercereau/hydrolix-metrics-go/internal/sinks"
@@ -53,5 +56,45 @@ func TestSeriesListString_JSON(t *testing.T) {
 	}
 	if len(parsed) != 1 || parsed[0].Metric != "s.test" {
 		t.Fatalf("unexpected parsed content: %#v", parsed)
+	}
+}
+
+// Per-call tags must survive the whole pipeline (buffer, batch, send), not
+// just CreateMetric: the poller's reason tag on error polls rides on them.
+func TestPerCallTagsReachThePayload(t *testing.T) {
+	var mu sync.Mutex
+	var sent []ddv2.MetricSeries
+	orig := submitMetrics
+	submitMetrics = func(p ddv2.MetricPayload) (ddv2.IntakePayloadAccepted, *http.Response, error) {
+		mu.Lock()
+		sent = append(sent, p.Series...)
+		mu.Unlock()
+		return ddv2.IntakePayloadAccepted{}, &http.Response{StatusCode: http.StatusAccepted}, nil
+	}
+	t.Cleanup(func() { submitMetrics = orig })
+
+	s := NewSink(DatadogOpts{
+		Namespace: "t", Subsystem: "t",
+		FlushInterval: time.Hour, QueueSize: 8, BatchSize: 1 << 20,
+		MaxRetries: 1, Concurrency: 1,
+	})
+	s.Start()
+	s.WithTags(sinks.Tags{"query": "q1"}).Inc("hydrolix.collector.poll", "total", 1,
+		sinks.Tags{"status": "error", "reason": "auth"})
+	s.Stop()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 1 {
+		t.Fatalf("want 1 series sent, got %d", len(sent))
+	}
+	got := map[string]bool{}
+	for _, tag := range sent[0].Tags {
+		got[tag] = true
+	}
+	for _, want := range []string{"query:q1", "status:error", "reason:auth"} {
+		if !got[want] {
+			t.Errorf("sent tags %v, missing %q", sent[0].Tags, want)
+		}
 	}
 }
