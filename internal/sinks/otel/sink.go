@@ -4,6 +4,7 @@ package otel
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -212,6 +213,7 @@ func (c *otelCore) start() {
 		// In your project, handle/log the error as needed.
 		return
 	}
+	exp = countingExporter{Exporter: exp, self: c.self}
 
 	readerOpts := []sdkmetric.PeriodicReaderOption{
 		sdkmetric.WithInterval(c.opts.ExportInterval),
@@ -257,6 +259,28 @@ var newExporter = func(opts OTelOpts, ts sdkmetric.TemporalitySelector) (sdkmetr
 		clientOpts = append(clientOpts, otlpmetricgrpc.WithTemporalitySelector(ts))
 		return otlpmetricgrpc.New(context.Background(), clientOpts...)
 	}
+}
+
+// countingExporter counts every export attempt on the self-sink as
+// hydrolix.sink.export{status=success|error} (the export-outcome metric
+// shared with the Datadog sink), so a sink that stops
+// delivering to its collector is visible without reading logs, and logs each
+// failure at ERROR (the SDK's default error handler is silent). The error is
+// returned unchanged.
+type countingExporter struct {
+	sdkmetric.Exporter
+	self sinks.MetricSink
+}
+
+func (e countingExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
+	err := e.Exporter.Export(ctx, rm)
+	status := "success"
+	if err != nil {
+		status = "error"
+		slog.Error("OTel export failed", "error", err)
+	}
+	e.self.Inc("hydrolix.sink.export", "total", 1, sinks.Tags{"status": status})
+	return err
 }
 
 func (c *otelCore) ensureStarted() { c.start() }

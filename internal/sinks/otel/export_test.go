@@ -12,12 +12,15 @@ import (
 	"github.com/mercereau/hydrolix-metrics-go/internal/sinks"
 )
 
-// memExporter records every Gauge datapoint it is asked to export, and the
-// metric names carried by each Export call.
+// memExporter records every Gauge datapoint it is asked to export and the
+// metric names carried by each Export call, counts its Export calls, and
+// fails them with err when set.
 type memExporter struct {
-	mu     sync.Mutex
-	points []metricdata.DataPoint[float64]
-	calls  [][]string
+	mu      sync.Mutex
+	points  []metricdata.DataPoint[float64]
+	calls   [][]string
+	exports int // every Export call, empty ones included
+	err     error
 }
 
 func (m *memExporter) Temporality(sdkmetric.InstrumentKind) metricdata.Temporality {
@@ -31,6 +34,7 @@ func (m *memExporter) Aggregation(k sdkmetric.InstrumentKind) sdkmetric.Aggregat
 func (m *memExporter) Export(_ context.Context, rm *metricdata.ResourceMetrics) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.exports++
 	var names []string
 	for _, sm := range rm.ScopeMetrics {
 		for _, md := range sm.Metrics {
@@ -43,7 +47,7 @@ func (m *memExporter) Export(_ context.Context, rm *metricdata.ResourceMetrics) 
 	if len(names) > 0 {
 		m.calls = append(m.calls, names)
 	}
-	return nil
+	return m.err
 }
 
 // exportCalls returns the metric names of each non-empty Export call.
@@ -51,6 +55,18 @@ func (m *memExporter) exportCalls() [][]string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([][]string(nil), m.calls...)
+}
+
+func (m *memExporter) exportCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.exports
+}
+
+func (m *memExporter) failWith(err error) {
+	m.mu.Lock()
+	m.err = err
+	m.mu.Unlock()
 }
 
 // blockingExporter never completes an export on its own, like a collector
