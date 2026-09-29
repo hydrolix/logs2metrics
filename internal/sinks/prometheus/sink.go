@@ -272,8 +272,11 @@ func (p *promCore) labelsFor(metricName string, tags sinks.Tags) []string {
 // Prometheus treats an empty label as absent, so scrapers see the same series
 // with the same values, and a counter does not reset. Histogram observations
 // can't be restored through the client, so a histogram that gains a label
-// starts over. The new vector is filled before it is swapped in, so a scrape
-// never sees it half built. The caller holds p.mu.
+// starts over. A carried-over counter does get a new created timestamp; only
+// Prometheus's opt-in created-timestamp-zero-ingestion (protobuf scrapes)
+// reads it, and would then see one reset at the widening. The new vector is
+// filled before it is swapped in, so a scrape never sees it half built. The
+// caller holds p.mu.
 func (p *promCore) widen(name string, labels []string) {
 	if cv := p.counters[name]; cv != nil {
 		nv := newCounterVec(name, labels)
@@ -320,7 +323,10 @@ func (s *slot) Collect(ch chan<- prom.Metric) {
 // publish makes c the vector scraped for name, registering its slot on
 // first use. Reusing a name for another metric type panics, as MustRegister
 // did before slots: slots declare no descriptors, so the registry no longer
-// catches it. The caller holds p.mu.
+// catches it. For the same reason a name shared with a collector registered
+// outside the sink (e.g. go_* runtime metrics) fails the scrape instead of
+// panicking at registration; the namespace prefix keeps sink names apart.
+// The caller holds p.mu.
 func (p *promCore) publish(kind, name string, c prom.Collector) {
 	sl := p.slots[name]
 	if sl == nil {
