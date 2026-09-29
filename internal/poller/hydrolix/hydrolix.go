@@ -560,8 +560,11 @@ func (c *Client) Query(queryName, sql string) (string, error) {
 // doQuery performs one HTTP query attempt with the given token and returns
 // the status code and body; only transport-level problems are errors.
 func (c *Client) doQuery(queryName, sql, token string) (int, string, error) {
+	// no_cache=1 is forced because a poll's SQL is byte-identical every
+	// time, so http-proxy would otherwise serve a stale cached window.
 	url := fmt.Sprintf("https://%s/query?%s", c.opts.Host, url.Values{
 		"hdx_query_admin_comment": {c.userAgentAdminComment(queryName)},
+		"no_cache":                {"1"},
 	}.Encode())
 
 	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, url, strings.NewReader(sql))
