@@ -4,6 +4,7 @@ package prometheus
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -11,11 +12,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/mercereau/hydrolix-metrics-go/internal/sinks"
 )
@@ -26,12 +29,11 @@ type promCore struct {
 	opts PromOpts
 	mu   sync.RWMutex
 
-	counters      map[string]*prom.CounterVec
-	counterLbls   map[string][]string
-	gauges        map[string]*prom.GaugeVec
-	gaugeLbls     map[string][]string
-	histograms    map[string]*prom.HistogramVec
-	histogramLbls map[string][]string
+	counters   map[string]*prom.CounterVec
+	gauges     map[string]*prom.GaugeVec
+	histograms map[string]*prom.HistogramVec
+	labels     map[string][]string // label names per metric name, shared by all vector types
+	slots      map[string]*slot    // registered collectors, by metric name (see slot)
 
 	// HTTP server state
 	srvMu   sync.Mutex
@@ -72,14 +74,13 @@ func NewSink(opts PromOpts) *PromScoped {
 		opts.HistogramBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 	}
 	core := &promCore{
-		reg:           prom.NewRegistry(),
-		opts:          opts,
-		counters:      map[string]*prom.CounterVec{},
-		counterLbls:   map[string][]string{},
-		gauges:        map[string]*prom.GaugeVec{},
-		gaugeLbls:     map[string][]string{},
-		histograms:    map[string]*prom.HistogramVec{},
-		histogramLbls: map[string][]string{},
+		reg:        prom.NewRegistry(),
+		opts:       opts,
+		counters:   map[string]*prom.CounterVec{},
+		gauges:     map[string]*prom.GaugeVec{},
+		histograms: map[string]*prom.HistogramVec{},
+		labels:     map[string][]string{},
+		slots:      map[string]*slot{},
 	}
 	if opts.RegisterGoCollectors {
 		core.reg.MustRegister(collectors.NewGoCollector())
@@ -135,9 +136,10 @@ func (s *PromScoped) Inc(name, unit string, value float64, tags sinks.Tags) {
 		return // Prom counters must not decrement; ignore non-positive
 	}
 	mName := s.p.counterName(name, unit)
-	lblNames := s.p.labelsFor(mName, mergeTags(s.base, tags))
-	cv := s.p.getOrCreateCounter(mName, lblNames)
-	cv.With(labelValues(lblNames, mergeTags(s.base, tags))).Add(value)
+	t := mergeTags(s.base, tags)
+	s.p.write(kindCounter, mName, t, func(lbls []string) {
+		s.p.counterVec(mName, lbls).With(labelValues(lbls, t)).Add(value)
+	})
 }
 
 func (s *PromScoped) Rate(name, unit string, value float64, tags sinks.Tags) {
@@ -147,17 +149,19 @@ func (s *PromScoped) Rate(name, unit string, value float64, tags sinks.Tags) {
 
 func (s *PromScoped) Gauge(name, unit string, value float64, tags sinks.Tags) {
 	mName := s.p.gaugeName(name, unit)
-	lblNames := s.p.labelsFor(mName, mergeTags(s.base, tags))
-	gv := s.p.getOrCreateGauge(mName, lblNames)
-	gv.With(labelValues(lblNames, mergeTags(s.base, tags))).Set(value)
+	t := mergeTags(s.base, tags)
+	s.p.write(kindGauge, mName, t, func(lbls []string) {
+		s.p.gaugeVec(mName, lbls).With(labelValues(lbls, t)).Set(value)
+	})
 }
 
 func (s *PromScoped) Timing(name string, d time.Duration, tags sinks.Tags) {
 	// Observe seconds in a histogram
 	mName := s.p.histoName(name, "seconds")
-	lblNames := s.p.labelsFor(mName, mergeTags(s.base, tags))
-	hv := s.p.getOrCreateHistogram(mName, lblNames)
-	hv.With(labelValues(lblNames, mergeTags(s.base, tags))).Observe(d.Seconds())
+	t := mergeTags(s.base, tags)
+	s.p.write(kindHistogram, mName, t, func(lbls []string) {
+		s.p.histogramVec(mName, lbls).With(labelValues(lbls, t)).Observe(d.Seconds())
+	})
 }
 
 // ---------- Core registry & vectors (shared across scopes) ----------
@@ -200,91 +204,228 @@ func (p *promCore) histoName(name, unit string) string {
 	return p.gaugeName(name, unit)
 }
 
-// labelsFor establishes the allowed label keys for a metric name (first call wins).
-// Later calls with extra keys are ignored; missing keys are set to "".
-func (p *promCore) labelsFor(metricName string, tags sinks.Tags) []string {
-	keys := sortedKeys(tags)
+const (
+	kindCounter   = "counter"
+	kindGauge     = "gauge"
+	kindHistogram = "histogram"
+)
+
+// write runs fn with the label names to use for a write of kind to name.
+// A write whose tag keys are all known and whose vector exists shares the
+// read lock with other writes (the vectors are safe for concurrent use). A
+// write that must create the vector or widen its labels takes the write
+// lock, so widening never runs while another write is in flight.
+func (p *promCore) write(kind, name string, t sinks.Tags, fn func(labels []string)) {
+	if p.writeKnown(kind, name, t, fn) {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if l, ok := p.counterLbls[metricName]; ok {
-		return l
-	}
-	if l, ok := p.gaugeLbls[metricName]; ok {
-		return l
-	}
-	if l, ok := p.histogramLbls[metricName]; ok {
-		return l
-	}
-	// First time: store set (same for any vec type with this name)
-	p.counterLbls[metricName] = keys
-	p.gaugeLbls[metricName] = keys
-	p.histogramLbls[metricName] = keys
-	return keys
+	fn(p.labelsFor(name, t))
 }
 
-func (p *promCore) getOrCreateCounter(name string, labelNames []string) *prom.CounterVec {
+// writeKnown is write's read-lock path; it reports whether it ran fn.
+func (p *promCore) writeKnown(kind, name string, t sinks.Tags, fn func(labels []string)) bool {
 	p.mu.RLock()
-	cv := p.counters[name]
-	p.mu.RUnlock()
-	if cv != nil {
+	defer p.mu.RUnlock()
+	sl := p.slots[name]
+	lbls := p.labels[name]
+	if sl == nil || sl.kind != kind || !covers(lbls, t) {
+		return false
+	}
+	fn(lbls)
+	return true
+}
+
+// covers reports whether every key of t is in the sorted list labels.
+func covers(labels []string, t sinks.Tags) bool {
+	for k := range t {
+		if i := sort.SearchStrings(labels, k); i == len(labels) || labels[i] != k {
+			return false
+		}
+	}
+	return true
+}
+
+// labelsFor returns the label names for a metric name. The first write sets
+// them; a later write carrying keys not seen before widens them, and every
+// existing vector of that name is rebuilt (see widen). Missing keys are
+// written as "". The caller holds p.mu.
+func (p *promCore) labelsFor(metricName string, tags sinks.Tags) []string {
+	keys := sortedKeys(tags)
+	cur, ok := p.labels[metricName]
+	if !ok {
+		p.labels[metricName] = keys
+		return keys
+	}
+	merged := unionSorted(cur, keys)
+	if len(merged) == len(cur) {
+		return cur
+	}
+	p.widen(metricName, merged)
+	p.labels[metricName] = merged
+	return merged
+}
+
+// widen rebuilds every vector named name with the label names in labels.
+// Counter and gauge series are carried over with "" for the new labels:
+// Prometheus treats an empty label as absent, so scrapers see the same series
+// with the same values, and a counter does not reset. Histogram observations
+// can't be restored through the client, so a histogram that gains a label
+// starts over. The new vector is filled before it is swapped in, so a scrape
+// never sees it half built. The caller holds p.mu.
+func (p *promCore) widen(name string, labels []string) {
+	if cv := p.counters[name]; cv != nil {
+		nv := newCounterVec(name, labels)
+		for _, m := range collectSeries(cv) {
+			nv.With(widenedLabels(m, labels)).Add(m.GetCounter().GetValue())
+		}
+		p.counters[name] = nv
+		p.publish(kindCounter, name, nv)
+	}
+	if gv := p.gauges[name]; gv != nil {
+		nv := newGaugeVec(name, labels)
+		for _, m := range collectSeries(gv) {
+			nv.With(widenedLabels(m, labels)).Set(m.GetGauge().GetValue())
+		}
+		p.gauges[name] = nv
+		p.publish(kindGauge, name, nv)
+	}
+	if hv := p.histograms[name]; hv != nil {
+		nv := p.newHistogramVec(name, labels)
+		p.histograms[name] = nv
+		p.publish(kindHistogram, name, nv)
+	}
+}
+
+// slot is what the registry sees for one metric: it forwards collection to
+// the vector currently stored in it. The registry fixes a metric name's
+// label names for the life of the process, even across Unregister, so a
+// vector can't be re-registered with more labels; a slot declares no
+// descriptors (an "unchecked" collector), which lets widen swap the vector
+// behind it instead.
+type slot struct {
+	kind string       // one metric type per name, as the registry enforced
+	cur  atomic.Value // holds the current vector (always the same Go type)
+}
+
+func (s *slot) Describe(chan<- *prom.Desc) {}
+
+func (s *slot) Collect(ch chan<- prom.Metric) {
+	if c, ok := s.cur.Load().(prom.Collector); ok {
+		c.Collect(ch)
+	}
+}
+
+// publish makes c the vector scraped for name, registering its slot on
+// first use. Reusing a name for another metric type panics, as MustRegister
+// did before slots: slots declare no descriptors, so the registry no longer
+// catches it. The caller holds p.mu.
+func (p *promCore) publish(kind, name string, c prom.Collector) {
+	sl := p.slots[name]
+	if sl == nil {
+		sl = &slot{kind: kind}
+		p.reg.MustRegister(sl)
+		p.slots[name] = sl
+	}
+	if sl.kind != kind {
+		panic(fmt.Sprintf("prometheus sink: %s is already registered as a %s, can't register it as a %s", name, sl.kind, kind))
+	}
+	sl.cur.Store(c)
+}
+
+// collectSeries reads the current series of a vector.
+func collectSeries(c prom.Collector) []*dto.Metric {
+	ch := make(chan prom.Metric)
+	go func() { c.Collect(ch); close(ch) }()
+	var out []*dto.Metric
+	for m := range ch {
+		var d dto.Metric
+		if err := m.Write(&d); err == nil {
+			out = append(out, &d)
+		}
+	}
+	return out
+}
+
+// widenedLabels returns m's label values over labels, "" where m has none.
+func widenedLabels(m *dto.Metric, labels []string) prom.Labels {
+	out := make(prom.Labels, len(labels))
+	for _, k := range labels {
+		out[k] = ""
+	}
+	for _, lp := range m.GetLabel() {
+		out[lp.GetName()] = lp.GetValue()
+	}
+	return out
+}
+
+// unionSorted merges two sorted, duplicate-free lists.
+func unionSorted(a, b []string) []string {
+	out := make([]string, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		switch {
+		case j == len(b) || (i < len(a) && a[i] < b[j]):
+			out = append(out, a[i])
+			i++
+		case i == len(a) || b[j] < a[i]:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i, j = i+1, j+1
+		}
+	}
+	return out
+}
+
+// counterVec, gaugeVec and histogramVec return the vector for name, creating
+// and publishing it with labelNames on first use. The caller holds p.mu.
+func (p *promCore) counterVec(name string, labelNames []string) *prom.CounterVec {
+	if cv := p.counters[name]; cv != nil {
 		return cv
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if cv = p.counters[name]; cv != nil {
-		return cv
-	}
-	cv = prom.NewCounterVec(prom.CounterOpts{
-		Name: name,
-		Help: name,
-	}, labelNames)
-	p.reg.MustRegister(cv)
+	cv := newCounterVec(name, labelNames)
+	p.publish(kindCounter, name, cv)
 	p.counters[name] = cv
 	return cv
 }
 
-func (p *promCore) getOrCreateGauge(name string, labelNames []string) *prom.GaugeVec {
-	p.mu.RLock()
-	gv := p.gauges[name]
-	p.mu.RUnlock()
-	if gv != nil {
+func (p *promCore) gaugeVec(name string, labelNames []string) *prom.GaugeVec {
+	if gv := p.gauges[name]; gv != nil {
 		return gv
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if gv = p.gauges[name]; gv != nil {
-		return gv
-	}
-	gv = prom.NewGaugeVec(prom.GaugeOpts{
-		Name: name,
-		Help: name,
-	}, labelNames)
-	p.reg.MustRegister(gv)
+	gv := newGaugeVec(name, labelNames)
+	p.publish(kindGauge, name, gv)
 	p.gauges[name] = gv
 	return gv
 }
 
-func (p *promCore) getOrCreateHistogram(name string, labelNames []string) *prom.HistogramVec {
-	p.mu.RLock()
-	hv := p.histograms[name]
-	p.mu.RUnlock()
-	if hv != nil {
+func (p *promCore) histogramVec(name string, labelNames []string) *prom.HistogramVec {
+	if hv := p.histograms[name]; hv != nil {
 		return hv
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if hv = p.histograms[name]; hv != nil {
-		return hv
-	}
-	hv = prom.NewHistogramVec(prom.HistogramOpts{
+	hv := p.newHistogramVec(name, labelNames)
+	p.publish(kindHistogram, name, hv)
+	p.histograms[name] = hv
+	return hv
+}
+
+func newCounterVec(name string, labelNames []string) *prom.CounterVec {
+	return prom.NewCounterVec(prom.CounterOpts{Name: name, Help: name}, labelNames)
+}
+
+func newGaugeVec(name string, labelNames []string) *prom.GaugeVec {
+	return prom.NewGaugeVec(prom.GaugeOpts{Name: name, Help: name}, labelNames)
+}
+
+func (p *promCore) newHistogramVec(name string, labelNames []string) *prom.HistogramVec {
+	return prom.NewHistogramVec(prom.HistogramOpts{
 		Name:    name,
 		Help:    name,
 		Buckets: p.opts.HistogramBuckets,
 	}, labelNames)
-	p.reg.MustRegister(hv)
-	p.histograms[name] = hv
-	return hv
 }
 
 // ---------- HTTP server management ----------
