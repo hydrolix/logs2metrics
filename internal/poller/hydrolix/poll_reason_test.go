@@ -129,3 +129,46 @@ func TestReloginFailuresAreTaggedAuth(t *testing.T) {
 		})
 	}
 }
+
+// Stop cancels the client's context while a poll may be in flight. That
+// request then fails with "context canceled", which is the collector
+// shutting down, not the cluster being unreachable: it must not be counted
+// as an error poll (reason=transport would fire on every restart).
+func TestPollCancelledByShutdownIsNotCounted(t *testing.T) {
+	arrived, release := make(chan struct{}), make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
+		select { // hold the request until the client gives up
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+	defer close(release) // runs first: frees the handler so Close can return
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sink := newCaptureSink()
+	c := &Client{
+		opts:       HydrolixOpts{Host: srv.Listener.Addr().String()},
+		httpClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+		ctx:        ctx,
+		config:     &QueriesConfig{},
+		selfSink:   sink,
+	}
+
+	done := make(chan bool)
+	go func() { done <- c.pollQuery(&QueryConfig{Name: "q1", renderedSQL: "select 1"}) }()
+	<-arrived
+	cancel()
+	if authFailed := <-done; authFailed {
+		t.Error("a cancelled poll must not report an auth failure")
+	}
+
+	for _, m := range sink.store.incs {
+		if m.name == "hydrolix.collector.poll" {
+			t.Fatalf("a poll cancelled by shutdown was counted: %v", m.tags)
+		}
+	}
+}
