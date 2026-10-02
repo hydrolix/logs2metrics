@@ -34,17 +34,19 @@ func TestSanitizeAndNames(t *testing.T) {
 func TestLabelsForAndMergeTags(t *testing.T) {
 	s := NewSink(PromOpts{})
 	p := s.p
+	p.mu.Lock()
 	tags1 := sinks.Tags{"a": "1", "b": "2"}
-	lbls := p.labelsFor("m1", tags1)
+	lbls := p.slotFor(kindCounter, "m1", tags1).labels
 	if len(lbls) != 2 {
 		t.Fatalf("expected 2 labels, got %d", len(lbls))
 	}
-	// call again with extra key; must return same label set
+	// call again with an extra key: the label set widens to include it
 	tags2 := sinks.Tags{"a": "1", "b": "2", "c": "3"}
-	lbls2 := p.labelsFor("m1", tags2)
-	if len(lbls2) != len(lbls) {
-		t.Fatalf("labels changed between calls: %v vs %v", lbls, lbls2)
+	lbls2 := p.slotFor(kindCounter, "m1", tags2).labels
+	if strings.Join(lbls2, ",") != "a,b,c" {
+		t.Fatalf("labels after an extra key = %v, want [a b c]", lbls2)
 	}
+	p.mu.Unlock()
 
 	// mergeTags sanitizes keys
 	merged := mergeTags(sinks.Tags{"9k": "v"}, sinks.Tags{"X": "y"})
