@@ -77,6 +77,23 @@ series. Run exactly one replica per configuration. See `DESIGN.md` for why
 this is safe in practice — the query window's backfill makes short restarts
 self-healing without needing a second replica for availability.
 
+### Container image
+
+Images are published for `linux/amd64` and `linux/arm64` under one tag;
+Docker and Kubernetes pull the right one for the node.
+
+The image runs as the non-root user `65532:65532` (numeric, so Kubernetes
+`runAsNonRoot: true` accepts it) with entrypoint
+`/usr/local/bin/hydrolix-collector`. Pass flags as Kubernetes `args` (or
+compose `command`); they are appended to the entrypoint. The collector
+writes no files, so a read-only root filesystem with all capabilities
+dropped works.
+
+Upgrading from an image before this layout: images up to `v1.1.0-hdx.1`
+kept the binary in `/root` and ran as root. A deployment that sets
+`workingDir: /root` and `command: [./hydrolix-collector]` must drop both
+lines when it moves to a newer image, or the container fails to start.
+
 ## Build the Go Binary
 
 ```bash
@@ -158,4 +175,26 @@ Use `type: gauge` for per-minute query results. Each poll re-reads a sliding win
 - Makefile with build/test/format/vet
 
 ## Releasing
-TODO: add Goreleaser, CI, etc.
+
+Images are built and pushed by GitHub Actions; there is nothing to run
+locally.
+
+- **Release:** on `main`, with the Makefile's `BASE_VERSION` at `vX.Y.Z`,
+  push an annotated tag `vX.Y.Z-hdx.N` with the release notes as its
+  message. `N` starts at 1 for each new `BASE_VERSION`; `-hdx.N` marks a
+  build of this fork, not a semver pre-release.
+
+  ```bash
+  git tag -a v1.1.0-hdx.2 -m "<release notes>" && git push origin v1.1.0-hdx.2
+  ```
+
+  The workflow checks the tag against `BASE_VERSION`, runs the tests, and
+  publishes the image as `vX.Y.Z-hdx.N` and `latest`.
+- **Dev images:** every push to `main` publishes `sha-<sha7>` and `main`. Any
+  branch can publish `branch-<name>-<sha7>` by running the "Dev image
+  (feature branch)" workflow manually.
+
+Each build compiles natively for `linux/amd64` and `linux/arm64`, checks
+that the binary reports the expected version on each, and publishes one
+multi-arch tag. The per-architecture images stay in the registry as
+`<tag>-amd64` and `<tag>-arm64`.

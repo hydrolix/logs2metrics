@@ -2,7 +2,6 @@ services:
   hydrolix-collector:
     build: .
     command:
-      - ./hydrolix-collector
       - --sink=prometheus
       - --environment=dev
     environment:
