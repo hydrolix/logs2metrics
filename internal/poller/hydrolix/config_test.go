@@ -1,6 +1,7 @@
 package hydrolix
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,5 +27,57 @@ func TestLoadConfigMissingSQLFileNamesSearchedPath(t *testing.T) {
 	searched := filepath.Join(dir, "sub", "missing.sql")
 	if !strings.Contains(err.Error(), searched) {
 		t.Errorf("error should name the path searched (%s), got: %v", searched, err)
+	}
+}
+
+// captureSlog routes the default slog logger into a buffer for the test.
+func captureSlog(t *testing.T) *strings.Builder {
+	t.Helper()
+	var buf strings.Builder
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	return &buf
+}
+
+// counter and rate metrics over-count: every poll re-reads the sliding
+// window, so each minute bucket is emitted about 20 times and Inc adds each
+// time. Loading a config must warn once per counter/rate metric, naming the
+// query and column, and stay silent for gauge and untyped metrics (which emit
+// as gauges). (HDX-12487)
+func TestCounterAndRateTypesWarnAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "queries.yaml")
+	config := `queries:
+  - name: q1
+    sql: select 1
+    metrics:
+      - {column: colA, name: m.a, type: counter}
+      - {column: colB, name: m.b, type: rate}
+      - {column: colC, name: m.c, type: gauge}
+      - {column: colD, name: m.d}
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	buf := captureSlog(t)
+	if _, err := LoadConfig(configPath, nil); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	logs := buf.String()
+	if got := strings.Count(logs, "level=WARN"); got != 2 {
+		t.Fatalf("want exactly 2 WARN lines (one per counter/rate metric), got %d:\n%s", got, logs)
+	}
+	for _, want := range []string{"colA", "colB", "q1"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("warnings should name %q, got:\n%s", want, logs)
+		}
+	}
+	for _, quiet := range []string{"colC", "colD"} {
+		if strings.Contains(logs, quiet) {
+			t.Errorf("%s is a gauge and must not be warned about, got:\n%s", quiet, logs)
+		}
 	}
 }
