@@ -24,18 +24,31 @@ permissions:
   contents: read
 
 jobs:
+  # Each architecture builds and is checked natively on its own runner, then
+  # pushes an <tag>-<arch> image; "manifest" joins them under the real tags.
   image:
-    name: Build and push (${{ inputs.environment }})
-    runs-on: ubuntu-latest
+    name: Build and push ${{ matrix.arch }} (${{ inputs.environment }})
+    runs-on: ${{ matrix.runner }}
     environment: ${{ inputs.environment }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       id-token: write  # mint the GitHub OIDC token exchanged for GCP credentials
+    outputs:
+      first: ${{ steps.validate.outputs.first }}
+      registry_host: ${{ steps.validate.outputs.registry_host }}
     env:
       ENVIRONMENT: ${{ inputs.environment }}
       IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
       VERSION: ${{ inputs.version }}
       TAGS: ${{ inputs.tags }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -50,7 +63,7 @@ jobs:
           read -ra tags <<< "$TAGS"
           [[ ${#tags[@]} -gt 0 ]] || { echo "::error::no tags given"; exit 1; }
           for tag in "${tags[@]}"; do
-            [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "::error::'$tag' is not a valid docker tag"; exit 1; }
+            [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}$ ]] || { echo "::error::'$tag' is not a valid docker tag"; exit 1; }
             # Defense in depth: only release may move release tags, even if
             # dev and release ever point at the same image path.
             if [[ "$ENVIRONMENT" != "release" && ( "$tag" == v* || "$tag" == "latest" ) ]]; then
@@ -63,13 +76,13 @@ jobs:
 
       - name: Build image
         shell: bash
+        env:
+          IMAGE: ${{ env.IMAGE_REPOSITORY }}:${{ steps.validate.outputs.first }}-${{ matrix.arch }}
         run: |
           set -euo pipefail
           created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          tag_args=()
-          for tag in $TAGS; do tag_args+=(-t "$IMAGE_REPOSITORY:$tag"); done
           docker buildx build \
-            --platform linux/amd64 \
+            --platform "linux/$ARCH" \
             --build-arg VERSION="$VERSION" \
             --build-arg COMMIT="${GITHUB_SHA::7}" \
             --build-arg DATE="$created" \
@@ -77,16 +90,18 @@ jobs:
             --label org.opencontainers.image.revision="$GITHUB_SHA" \
             --label org.opencontainers.image.version="$VERSION" \
             --label org.opencontainers.image.created="$created" \
-            "${tag_args[@]}" \
+            -t "$IMAGE" \
             --load .
 
-      - name: Check stamped version
+      - name: Check stamped version and architecture
         shell: bash
         env:
-          IMAGE: ${{ env.IMAGE_REPOSITORY }}:${{ steps.validate.outputs.first }}
+          IMAGE: ${{ env.IMAGE_REPOSITORY }}:${{ steps.validate.outputs.first }}-${{ matrix.arch }}
         run: |
           set -euo pipefail
-          out="$(docker run --rm "$IMAGE" ./hydrolix-collector version)"
+          arch="$(docker image inspect --format '{{.Architecture}}' "$IMAGE")"
+          [[ "$arch" == "$ARCH" ]] || { echo "::error::image is $arch, expected $ARCH"; exit 1; }
+          out="$(docker run --rm "$IMAGE" version)"
           echo "$out"
           grep -qxF "version: $VERSION" <<< "$out" || { echo "::error::image reports a version other than $VERSION"; exit 1; }
 
@@ -97,16 +112,61 @@ jobs:
           service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
           registry_host: ${{ steps.validate.outputs.registry_host }}
 
-      - name: Push image
+      - name: Push ${{ matrix.arch }} image
+        shell: bash
+        env:
+          IMAGE: ${{ env.IMAGE_REPOSITORY }}:${{ steps.validate.outputs.first }}-${{ matrix.arch }}
+        run: docker push "$IMAGE"
+
+  manifest:
+    name: Publish multi-arch tags (${{ inputs.environment }})
+    needs: image
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write  # mint the GitHub OIDC token exchanged for GCP credentials
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+      VERSION: ${{ inputs.version }}
+      TAGS: ${{ inputs.tags }}
+      FIRST: ${{ needs.image.outputs.first }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Authenticate GAR (Workload Identity Federation)
+        uses: ./.github/actions/setup-google-application-credentials
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
+          registry_host: ${{ needs.image.outputs.registry_host }}
+
+      - name: Create and push multi-arch tags
         shell: bash
         run: |
           set -euo pipefail
-          for tag in $TAGS; do docker push "$IMAGE_REPOSITORY:$tag"; done
-          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REPOSITORY:${TAGS%% *}")"
+          tag_args=()
+          for tag in $TAGS; do tag_args+=(-t "$IMAGE_REPOSITORY:$tag"); done
+          docker buildx imagetools create "${tag_args[@]}" \
+            "$IMAGE_REPOSITORY:$FIRST-amd64" \
+            "$IMAGE_REPOSITORY:$FIRST-arm64"
+
+      - name: Check both platforms are published
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in $TAGS; do
+            platforms="$(docker buildx imagetools inspect "$IMAGE_REPOSITORY:$tag" | awk '$1 == "Platform:" {print $2}' | sort | tr '\n' ' ')"
+            [[ "$platforms" == "linux/amd64 linux/arm64 " ]] || { echo "::error::$tag has platforms '$platforms', expected linux/amd64 and linux/arm64"; exit 1; }
+          done
+          digest="$(docker buildx imagetools inspect "$IMAGE_REPOSITORY:$FIRST" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           {
-            echo "### Pushed \`$VERSION\` to $ENVIRONMENT"
+            echo "### Pushed \`$VERSION\` to $ENVIRONMENT (linux/amd64, linux/arm64)"
             echo
             for tag in $TAGS; do echo "- \`$IMAGE_REPOSITORY:$tag\`"; done
             echo
-            echo "Digest: \`$digest\`"
+            echo "Digest: \`$IMAGE_REPOSITORY@$digest\`"
           } >> "$GITHUB_STEP_SUMMARY"
