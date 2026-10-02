@@ -129,8 +129,8 @@ func (s *PromScoped) Inc(name, unit string, value float64, tags sinks.Tags) {
 	}
 	mName := s.p.counterName(name, unit)
 	t := mergeTags(s.base, tags)
-	s.p.write(kindCounter, mName, t, func(v prom.Collector, lbls []string) {
-		v.(*prom.CounterVec).With(labelValues(lbls, t)).Add(value)
+	write(s.p, kindCounter, mName, t, func(v *prom.CounterVec, lbls []string) {
+		v.With(labelValues(lbls, t)).Add(value)
 	})
 }
 
@@ -142,8 +142,8 @@ func (s *PromScoped) Rate(name, unit string, value float64, tags sinks.Tags) {
 func (s *PromScoped) Gauge(name, unit string, value float64, tags sinks.Tags) {
 	mName := s.p.gaugeName(name, unit)
 	t := mergeTags(s.base, tags)
-	s.p.write(kindGauge, mName, t, func(v prom.Collector, lbls []string) {
-		v.(*prom.GaugeVec).With(labelValues(lbls, t)).Set(value)
+	write(s.p, kindGauge, mName, t, func(v *prom.GaugeVec, lbls []string) {
+		v.With(labelValues(lbls, t)).Set(value)
 	})
 }
 
@@ -151,8 +151,8 @@ func (s *PromScoped) Timing(name string, d time.Duration, tags sinks.Tags) {
 	// Observe seconds in a histogram
 	mName := s.p.histoName(name, "seconds")
 	t := mergeTags(s.base, tags)
-	s.p.write(kindHistogram, mName, t, func(v prom.Collector, lbls []string) {
-		v.(*prom.HistogramVec).With(labelValues(lbls, t)).Observe(d.Seconds())
+	write(s.p, kindHistogram, mName, t, func(v *prom.HistogramVec, lbls []string) {
+		v.With(labelValues(lbls, t)).Observe(d.Seconds())
 	})
 }
 
@@ -206,26 +206,28 @@ const (
 // name. A write whose tag keys are all known shares the read lock with other
 // writes (the vectors are safe for concurrent use). A write that must create
 // the metric or widen its labels takes the write lock, so widening never runs
-// while another write is in flight.
-func (p *promCore) write(kind, name string, t sinks.Tags, fn func(v prom.Collector, labels []string)) {
-	if p.writeKnown(kind, name, t, fn) {
+// while another write is in flight. The one cast from the slot's atomic.Value
+// to V lives here; it can't fail because slotFor keeps one kind — and so one
+// vector type — per name. (A method can't be generic, hence the p argument.)
+func write[V prom.Collector](p *promCore, kind, name string, t sinks.Tags, fn func(v V, labels []string)) {
+	if writeKnown(p, kind, name, t, fn) {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	sl := p.slotFor(kind, name, t)
-	fn(sl.cur.Load().(prom.Collector), sl.labels)
+	fn(sl.cur.Load().(V), sl.labels)
 }
 
 // writeKnown is write's read-lock path; it reports whether it ran fn.
-func (p *promCore) writeKnown(kind, name string, t sinks.Tags, fn func(v prom.Collector, labels []string)) bool {
+func writeKnown[V prom.Collector](p *promCore, kind, name string, t sinks.Tags, fn func(v V, labels []string)) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	sl := p.slots[name]
 	if sl == nil || sl.kind != kind || !covers(sl.labels, t) {
 		return false
 	}
-	fn(sl.cur.Load().(prom.Collector), sl.labels)
+	fn(sl.cur.Load().(V), sl.labels)
 	return true
 }
 
