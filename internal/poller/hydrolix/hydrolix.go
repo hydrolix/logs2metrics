@@ -363,16 +363,22 @@ func (c *Client) pollQuery(q *QueryConfig) bool {
 
 	body, err := c.Query(q.Name, q.RenderedSQL())
 	if err != nil {
+		if c.ctx.Err() != nil {
+			// Stop cancelled the request mid-flight: the collector is
+			// shutting down, not failing to reach the cluster.
+			slog.Debug("Poll cancelled by shutdown", "query", q.Name)
+			return false
+		}
 		slog.Error("Failed to query Hydrolix", "query", q.Name, "error", err)
-		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
-		var qerr *QueryError
-		return errors.As(err, &qerr) && qerr.AuthFailed()
+		reason := queryErrorReason(err)
+		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error", "reason": reason}))
+		return reason == reasonAuth
 	}
 
 	var resp GenericResponse
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		slog.Error("Failed to unmarshal response", "query", q.Name, "error", err)
-		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error"}))
+		c.selfSink.Inc("hydrolix.collector.poll", "total", 1, sinks.MergeTags(pollTags, sinks.Tags{"status": "error", "reason": reasonDecode}))
 		return false
 	}
 
@@ -383,6 +389,28 @@ func (c *Client) pollQuery(q *QueryConfig) bool {
 
 	slog.Debug("Completed polling", "query", q.Name, "rows", len(resp.Data))
 	return false
+}
+
+// Values of the reason tag on error polls of hydrolix.collector.poll.
+const (
+	reasonAuth      = "auth"      // Hydrolix refused the credentials
+	reasonQuery     = "query"     // any other non-200 response (bad SQL, server error)
+	reasonTransport = "transport" // no response at all (timeout, DNS, TLS or connection failure)
+	reasonDecode    = "decode"    // a 200 response that isn't valid JSON; set by pollQuery
+)
+
+// queryErrorReason classifies a Query error for the reason tag of an error
+// poll. It returns reasonAuth, reasonQuery or reasonTransport; reasonDecode
+// is set by pollQuery for a 200 response it can't parse.
+func queryErrorReason(err error) string {
+	var qerr *QueryError
+	if !errors.As(err, &qerr) {
+		return reasonTransport
+	}
+	if qerr.AuthFailed() {
+		return reasonAuth
+	}
+	return reasonQuery
 }
 
 // Stop signals all listeners that we're shutting down.
