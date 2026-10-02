@@ -63,6 +63,7 @@ jobs:
           read -ra tags <<< "$TAGS"
           [[ ${#tags[@]} -gt 0 ]] || { echo "::error::no tags given"; exit 1; }
           for tag in "${tags[@]}"; do
+            # 121, not docker's 128: each tag also gets an -amd64/-arm64 copy.
             [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}$ ]] || { echo "::error::'$tag' is not a valid docker tag"; exit 1; }
             # Defense in depth: only release may move release tags, even if
             # dev and release ever point at the same image path.
@@ -159,7 +160,8 @@ jobs:
         run: |
           set -euo pipefail
           for tag in $TAGS; do
-            platforms="$(docker buildx imagetools inspect "$IMAGE_REPOSITORY:$tag" | awk '$1 == "Platform:" {print $2}' | sort | tr '\n' ' ')"
+            # Attestation manifests, if the build ever adds them, list as unknown/unknown.
+            platforms="$(docker buildx imagetools inspect "$IMAGE_REPOSITORY:$tag" | awk '$1 == "Platform:" && $2 != "unknown/unknown" {print $2}' | sort | tr '\n' ' ')"
             [[ "$platforms" == "linux/amd64 linux/arm64 " ]] || { echo "::error::$tag has platforms '$platforms', expected linux/amd64 and linux/arm64"; exit 1; }
           done
           digest="$(docker buildx imagetools inspect "$IMAGE_REPOSITORY:$FIRST" --format '{{json .Manifest.Digest}}' | tr -d '"')"
