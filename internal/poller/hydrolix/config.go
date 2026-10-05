@@ -3,6 +3,7 @@ package hydrolix
 import (
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"text/template"
@@ -137,6 +138,15 @@ func resolveConfig(cfg *QueriesConfig, fsys fs.FS, baseDir, root string) (*Queri
 		// Default timestamp column.
 		if q.TimestampColumn == "" {
 			q.TimestampColumn = "time"
+		}
+
+		// counter and rate add on every poll, and the sliding window re-reads
+		// each minute bucket many times, so they over-count (HDX-12487).
+		for _, mc := range q.Metrics {
+			if mc.Type == "counter" || mc.Type == "rate" {
+				slog.Warn("Metric type over-counts with the sliding window; use gauge for per-minute query results",
+					"query", q.Name, "column", mc.Column, "type", mc.Type)
+			}
 		}
 
 		// Resolve SQL: inline or from file.

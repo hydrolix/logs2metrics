@@ -148,6 +148,8 @@ To add a new query, create a `.sql` file and add an entry to the YAML -- no Go c
 
 Note that `sql_file` paths are resolved **relative to the config file's directory**, not the working directory. A config at `examples/prod/queries.yaml` referring to `sql_file: edge.sql` loads `examples/prod/edge.sql`, whatever directory you run the collector from.
 
+Use `type: gauge` for per-minute query results. Each poll re-reads a sliding window (by default 6 to 1 minutes ago), so every minute bucket is emitted many times: a gauge re-states the value harmlessly, while `counter` and `rate` add it again on every re-read and over-count. The collector logs a startup warning for each `counter`/`rate` metric in the config.
+
 ## Features
 - YAML-driven query configuration -- add queries without writing Go
 - Cobra command structure (`root`, `version`)
