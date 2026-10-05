@@ -82,3 +82,43 @@ func TestStartStopHTTPServer(t *testing.T) {
 
 	s.Stop()
 }
+
+// The poller's HTTP client times out at 30s, so the default buckets must
+// reach it: a poll slowing from 10s toward the timeout has to land in a
+// real bucket, not only +Inf, or a p95 alert near the timeout can't be set.
+// (HDX-12525)
+func TestDefaultHistogramBucketsReachPollTimeout(t *testing.T) {
+	s := NewSink(PromOpts{})
+	s.Timing("poll.duration", 12*time.Second, nil)
+
+	assertLines(t, scrapeLines(t, s, "poll_duration_seconds_bucket"), []string{
+		`poll_duration_seconds_bucket{le="+Inf"} 1`,
+		`poll_duration_seconds_bucket{le="0.001"} 0`,
+		`poll_duration_seconds_bucket{le="0.005"} 0`,
+		`poll_duration_seconds_bucket{le="0.01"} 0`,
+		`poll_duration_seconds_bucket{le="0.025"} 0`,
+		`poll_duration_seconds_bucket{le="0.05"} 0`,
+		`poll_duration_seconds_bucket{le="0.1"} 0`,
+		`poll_duration_seconds_bucket{le="0.25"} 0`,
+		`poll_duration_seconds_bucket{le="0.5"} 0`,
+		`poll_duration_seconds_bucket{le="1"} 0`,
+		`poll_duration_seconds_bucket{le="2.5"} 0`,
+		`poll_duration_seconds_bucket{le="5"} 0`,
+		`poll_duration_seconds_bucket{le="10"} 0`,
+		`poll_duration_seconds_bucket{le="15"} 1`,
+		`poll_duration_seconds_bucket{le="20"} 1`,
+		`poll_duration_seconds_bucket{le="30"} 1`,
+	})
+}
+
+// A HistogramBuckets option replaces the defaults entirely.
+func TestCustomHistogramBucketsOverrideDefaults(t *testing.T) {
+	s := NewSink(PromOpts{HistogramBuckets: []float64{1, 2}})
+	s.Timing("poll.duration", 1500*time.Millisecond, nil)
+
+	assertLines(t, scrapeLines(t, s, "poll_duration_seconds_bucket"), []string{
+		`poll_duration_seconds_bucket{le="+Inf"} 1`,
+		`poll_duration_seconds_bucket{le="1"} 0`,
+		`poll_duration_seconds_bucket{le="2"} 1`,
+	})
+}
