@@ -77,6 +77,16 @@ series. Run exactly one replica per configuration. See `DESIGN.md` for why
 this is safe in practice — the query window's backfill makes short restarts
 self-healing without needing a second replica for availability.
 
+### Container image
+
+The image runs as non-root user `1000` and its entrypoint is the collector
+binary, so pass flags as Kubernetes `args` (or compose `command`).
+
+Earlier images kept the binary in `/root` and ran as root. A deployment
+that sets `workingDir: /root` and `command: [./hydrolix-collector]` must
+drop both lines when it moves to a newer image, or the container fails to
+start.
+
 ## Build the Go Binary
 
 ```bash
@@ -158,4 +168,6 @@ Use `type: gauge` for per-minute query results. Each poll re-reads a sliding win
 - Makefile with build/test/format/vet
 
 ## Releasing
-TODO: add Goreleaser, CI, etc.
+
+Images are built and pushed by GitHub Actions; the header comments in
+`.github/workflows/` describe the release and dev-image process.

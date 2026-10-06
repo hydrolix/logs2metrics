@@ -1,5 +1,8 @@
 name: Dev image (main)
 
+# Every push to main publishes the dev image as sha-<sha7> and main. Images
+# are multi-arch (linux/amd64 + linux/arm64); see _build-push-image.yml.
+
 on:
   push:
     branches: [main]
