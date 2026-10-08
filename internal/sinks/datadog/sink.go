@@ -291,13 +291,15 @@ func (dd *Sink) runCollector() {
 			buffer = append(buffer, m)
 			if len(buffer) >= dd.opts.BatchSize {
 				dd.flush(buffer)
-				buffer = buffer[:0]
+				// A fresh slice, not buffer[:0]: the flushed batch is still
+				// queued for the sender and must not be overwritten.
+				buffer = make([]datadogV2.MetricSeries, 0, dd.opts.BatchSize)
 				resetTimer(timer, dd.opts.FlushInterval)
 			}
 		case <-timer.C:
 			if len(buffer) > 0 {
 				dd.flush(buffer)
-				buffer = buffer[:0]
+				buffer = make([]datadogV2.MetricSeries, 0, dd.opts.BatchSize)
 			}
 			resetTimer(timer, dd.opts.FlushInterval)
 		}

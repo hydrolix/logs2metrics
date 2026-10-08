@@ -3,6 +3,7 @@ package datadog
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -56,6 +57,62 @@ func TestSeriesListString_JSON(t *testing.T) {
 	}
 	if len(parsed) != 1 || parsed[0].Metric != "s.test" {
 		t.Fatalf("unexpected parsed content: %#v", parsed)
+	}
+}
+
+// A batch handed to the sender must not change afterwards: the collector keeps
+// filling its next batch while the sender is still working on the last one.
+// The fake sender holds the first payload until the collector has buffered
+// the next batch, then records what it was given. Covers both flush paths:
+// a full batch and the flush timer. Run with -race.
+func TestFlushedBatchIsNotOverwrittenByTheNextOne(t *testing.T) {
+	cases := []struct {
+		name      string
+		batchSize int
+		interval  time.Duration
+	}{
+		{"batch full", 2, time.Hour},
+		{"flush timer", 1 << 20, 20 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var sent []float64
+			held, release := make(chan struct{}), make(chan struct{})
+			var first sync.Once
+			orig := submitMetrics
+			submitMetrics = func(p ddv2.MetricPayload) (ddv2.IntakePayloadAccepted, *http.Response, error) {
+				first.Do(func() { close(held); <-release })
+				mu.Lock()
+				for _, s := range p.Series {
+					sent = append(sent, *s.Points[0].Value)
+				}
+				mu.Unlock()
+				return ddv2.IntakePayloadAccepted{}, &http.Response{StatusCode: http.StatusAccepted}, nil
+			}
+			t.Cleanup(func() { submitMetrics = orig })
+
+			s := NewSink(DatadogOpts{
+				Namespace: "t", Subsystem: "t",
+				FlushInterval: tc.interval, QueueSize: 8, BatchSize: tc.batchSize,
+				MaxRetries: 1, Concurrency: 1,
+			})
+			s.Start()
+			s.Gauge("m", "unit", 0, nil)
+			s.Gauge("m", "unit", 1, nil) // first batch: flushed to the sender
+			<-held
+			s.Gauge("m", "unit", 2, nil)
+			s.Gauge("m", "unit", 3, nil) // second batch, written while the first is held
+			time.Sleep(100 * time.Millisecond)
+			close(release)
+			s.Stop()
+
+			mu.Lock()
+			defer mu.Unlock()
+			if want := []float64{0, 1, 2, 3}; !slices.Equal(sent, want) {
+				t.Fatalf("sent values %v, want %v", sent, want)
+			}
+		})
 	}
 }
 
